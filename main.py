@@ -47,7 +47,7 @@ guild_object = discord.Object(id=int(GUILD_ID))
 async def on_ready():
     print(f"Bot eingeloggt als: {bot.user}")
     print("Sorare Streak Builder gestartet.")
-    print("Version: FINAL ohne /test + Team 1 bestes Team")
+    print("Version: Öffentliche Streak-Auswahl + Team 1 bestes Team")
 
 
 
@@ -511,7 +511,7 @@ async def streakteam(
     await interaction.response.send_message(
         embed=view.summary_embed(),
         view=view,
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
