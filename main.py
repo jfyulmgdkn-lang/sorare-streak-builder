@@ -47,7 +47,7 @@ guild_object = discord.Object(id=int(GUILD_ID))
 async def on_ready():
     print(f"Bot eingeloggt als: {bot.user}")
     print("Sorare Streak Builder gestartet.")
-    print("Version: MLS + harter Startelf-Filter + öffentliche Auswahl")
+    print("Version: MLS Rare eigene Streak-Ziele + harter Startelf-Filter")
 
 
 
@@ -77,11 +77,15 @@ STREAK_POINT_TARGETS = {
 def get_streak_point_choices(
     competition_key: str,
     selected_value: int | None = None,
+    rarity: str | None = None,
 ):
-    values = STREAK_POINT_TARGETS.get(
-        competition_key,
-        [320, 360, 380, 420, 440, 470],
-    )
+    if competition_key == "mlspa" and rarity == "rare":
+        values = [380, 420, 440, 460, 510]
+    else:
+        values = STREAK_POINT_TARGETS.get(
+            competition_key,
+            [320, 360, 380, 420, 440, 470],
+        )
 
     return [
         discord.SelectOption(
@@ -96,11 +100,15 @@ def get_streak_point_choices(
 def get_streak_number(
     competition_key: str,
     target_points: int,
+    rarity: str | None = None,
 ) -> int:
-    values = STREAK_POINT_TARGETS.get(
-        competition_key,
-        [320, 360, 380, 420, 440, 470],
-    )
+    if competition_key == "mlspa" and rarity == "rare":
+        values = [380, 420, 440, 460, 510]
+    else:
+        values = STREAK_POINT_TARGETS.get(
+            competition_key,
+            [320, 360, 380, 420, 440, 470],
+        )
 
     try:
         return values.index(target_points) + 1
@@ -201,6 +209,7 @@ class PointTargetSelect(discord.ui.Select):
             options=get_streak_point_choices(
                 view_ref.competition_key,
                 view_ref.target_points,
+                view_ref.rarity,
             ),
             row=0,
         )
@@ -748,6 +757,7 @@ async def run_streakteam_analysis(
         streak_number = get_streak_number(
             competition_key,
             zielpunkte,
+            rarity,
         )
 
         # Für Streak 1-3 sollen die Spieler möglichst gleichzeitig
