@@ -47,7 +47,427 @@ guild_object = discord.Object(id=int(GUILD_ID))
 async def on_ready():
     print(f"Bot eingeloggt als: {bot.user}")
     print("Sorare Streak Builder gestartet.")
-    print("Version: FINAL ohne Test-Befehl + Team 1 bestes Team")
+    print("Version: FINAL ohne /test + Team 1 bestes Team")
+
+
+
+competition_choices = [
+    app_commands.Choice(name=label, value=key)
+    for key, label in PRO_COMPETITIONS.items()
+]
+
+
+
+STREAK_POINT_TARGETS = {
+    "bundesliga-de": [320, 360, 380, 420, 440, 470],
+    "2-bundesliga": [320, 360, 380, 420, 440, 470],
+    "premier-league-gb-eng": [320, 360, 380, 400, 430, 450],
+    "laliga-es": [320, 360, 380, 420, 440, 470],
+    "ligue-1-fr": [320, 360, 380, 410, 440, 460],
+    "ligue-2-fr": [320, 360, 380, 420, 440, 470],
+    "mlspa": [340, 380, 400, 420, 460],
+    "austrian-bundesliga": [320, 360, 380, 420, 440, 470],
+    "1-hnl": [320, 360, 380, 420, 440, 470],
+    "primeira-liga-pt": [320, 360, 380, 410, 440, 460],
+    "jupiler-pro-league": [320, 360, 380, 410, 440, 460],
+    "contender": [320, 360, 380, 420, 440, 470],
+}
+
+
+def get_streak_point_choices(
+    competition_key: str,
+    selected_value: int | None = None,
+):
+    values = STREAK_POINT_TARGETS.get(
+        competition_key,
+        [320, 360, 380, 420, 440, 470],
+    )
+
+    return [
+        discord.SelectOption(
+            label=f"{value} Punkte",
+            value=str(value),
+            default=(selected_value == value),
+        )
+        for value in values
+    ]
+
+
+def get_streak_number(
+    competition_key: str,
+    target_points: int,
+) -> int:
+    values = STREAK_POINT_TARGETS.get(
+        competition_key,
+        [320, 360, 380, 420, 440, 470],
+    )
+
+    try:
+        return values.index(target_points) + 1
+    except ValueError:
+        return 99
+
+
+WEEKDAYS_DE = [
+    "Mo",
+    "Di",
+    "Mi",
+    "Do",
+    "Fr",
+    "Sa",
+    "So",
+]
+
+
+def build_date_options(
+    default_offset: int = 0,
+    selected_date: str | None = None,
+):
+    """
+    Discord erlaubt maximal 25 Einträge pro Select-Menü.
+    Deshalb zeigen wir heute + die nächsten 20 Tage an.
+    """
+    today = datetime.now(timezone.utc).date()
+    options = []
+
+    for offset in range(21):
+        day = today + timedelta(days=offset)
+        weekday = WEEKDAYS_DE[day.weekday()]
+        label = f"{weekday}, {day.strftime('%d.%m.%Y')}"
+
+        is_default = (
+            day.isoformat() == selected_date
+            if selected_date is not None
+            else offset == default_offset
+        )
+
+        options.append(
+            discord.SelectOption(
+                label=label,
+                value=day.isoformat(),
+                default=is_default,
+            )
+        )
+
+    return options
+
+
+class StartDateSelect(discord.ui.Select):
+    def __init__(self, view_ref):
+        self.view_ref = view_ref
+        super().__init__(
+            placeholder="📅 Von-Datum auswählen",
+            min_values=1,
+            max_values=1,
+            options=build_date_options(
+                default_offset=0,
+                selected_date=view_ref.start_date,
+            ),
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view_ref.start_date = self.values[0]
+        await self.view_ref.refresh_message(interaction)
+
+
+class EndDateSelect(discord.ui.Select):
+    def __init__(self, view_ref):
+        self.view_ref = view_ref
+        super().__init__(
+            placeholder="📅 Bis-Datum auswählen",
+            min_values=1,
+            max_values=1,
+            options=build_date_options(
+                default_offset=4,
+                selected_date=view_ref.end_date,
+            ),
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view_ref.end_date = self.values[0]
+        await self.view_ref.refresh_message(interaction)
+
+
+
+class PointTargetSelect(discord.ui.Select):
+    def __init__(self, view_ref):
+        self.view_ref = view_ref
+        super().__init__(
+            placeholder="🎯 Streak-Punkteziel auswählen",
+            min_values=1,
+            max_values=1,
+            options=get_streak_point_choices(
+                view_ref.competition_key,
+                view_ref.target_points,
+            ),
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view_ref.target_points = int(self.values[0])
+        await self.view_ref.refresh_message(interaction)
+
+
+class StrategySelect(discord.ui.Select):
+    def __init__(self, view_ref):
+        self.view_ref = view_ref
+
+        labels = {
+            "safe": "🛡️ Safe",
+            "balanced": "⚖️ Ausgeglichen",
+            "risky": "🚀 Risky",
+        }
+
+        descriptions = {
+            "safe": "Mehr Startelf-Sicherheit, Clean Sheet und Stacking",
+            "balanced": "Ausgewogene Mischung aus Sicherheit und Qualität",
+            "risky": "Mehr Einzelqualität und offensive Upside",
+        }
+
+        options = [
+            discord.SelectOption(
+                label=labels[value],
+                value=value,
+                description=descriptions[value],
+                default=(view_ref.strategy_mode == value),
+            )
+            for value in ("safe", "balanced", "risky")
+        ]
+
+        super().__init__(
+            placeholder="🧠 Strategie auswählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view_ref.strategy_mode = self.values[0]
+        await self.view_ref.refresh_message(interaction)
+
+
+class BuildTeamButton(discord.ui.Button):
+    def __init__(self, view_ref):
+        self.view_ref = view_ref
+        super().__init__(
+            label="Team bauen",
+            style=discord.ButtonStyle.green,
+            emoji="🔥",
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.view_ref.target_points is None:
+            await interaction.response.send_message(
+                "❌ Bitte zuerst dein Streak-Punkteziel auswählen.",
+                ephemeral=True,
+            )
+            return
+
+        start_dt = datetime.strptime(
+            self.view_ref.start_date,
+            "%Y-%m-%d",
+        ).date()
+
+        end_dt = datetime.strptime(
+            self.view_ref.end_date,
+            "%Y-%m-%d",
+        ).date()
+
+        if end_dt < start_dt:
+            await interaction.response.send_message(
+                "❌ Das Bis-Datum darf nicht vor dem Von-Datum liegen.",
+                ephemeral=True,
+            )
+            return
+
+        for item in self.view_ref.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.view_ref.summary_embed(analysing=True),
+            view=self.view_ref,
+        )
+
+        await run_streakteam_analysis(
+            interaction=interaction,
+            competition_key=self.view_ref.competition_key,
+            competition_name=self.view_ref.competition_name,
+            rarity=self.view_ref.rarity,
+            rarity_name=self.view_ref.rarity_name,
+            zielpunkte=self.view_ref.target_points,
+            strategy_mode=self.view_ref.strategy_mode,
+            von=self.view_ref.start_date,
+            bis=self.view_ref.end_date,
+        )
+
+
+class DateRangeView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        competition_key: str,
+        competition_name: str,
+        rarity: str,
+        rarity_name: str,
+    ):
+        super().__init__(timeout=300)
+
+        today = datetime.now(timezone.utc).date()
+
+        self.owner_id = owner_id
+        self.competition_key = competition_key
+        self.competition_name = competition_name
+        self.rarity = rarity
+        self.rarity_name = rarity_name
+        self.target_points = None
+        self.strategy_mode = "balanced"
+
+        self.start_date = today.isoformat()
+        self.end_date = (today + timedelta(days=4)).isoformat()
+
+        self.add_item(PointTargetSelect(self))
+        self.add_item(StartDateSelect(self))
+        self.add_item(EndDateSelect(self))
+        self.add_item(StrategySelect(self))
+        self.add_item(BuildTeamButton(self))
+
+    def summary_text(self):
+        start_display = datetime.strptime(
+            self.start_date,
+            "%Y-%m-%d",
+        ).strftime("%d.%m.%Y")
+
+        end_display = datetime.strptime(
+            self.end_date,
+            "%Y-%m-%d",
+        ).strftime("%d.%m.%Y")
+
+        target_text = (
+            f"{self.target_points} Punkte"
+            if self.target_points is not None
+            else "noch auswählen"
+        )
+
+        return (
+            "🔥 **Sorare Streak Builder**\n"
+            "\n"
+            f"🏆 **Wettbewerb:** {self.competition_name}\n"
+            f"💎 **Seltenheit:** {self.rarity_name}\n"
+            f"🎯 **Ziel:** {target_text}\n"
+            f"📅 **Von:** {start_display}\n"
+            f"📅 **Bis:** {end_display}\n"
+            "\n"
+            "👇 **Auswahl unten:**\n"
+            "1. 🎯 Streak-Punkteziel\n"
+            "2. 📅 Von-Datum\n"
+            "3. 📅 Bis-Datum\n"
+            "4. 🔥 Team bauen"
+        )
+
+
+    def summary_embed(self, analysing: bool = False):
+        start_display = datetime.strptime(
+            self.start_date,
+            "%Y-%m-%d",
+        ).strftime("%d.%m.%Y")
+
+        end_display = datetime.strptime(
+            self.end_date,
+            "%Y-%m-%d",
+        ).strftime("%d.%m.%Y")
+
+        target_text = (
+            f"{self.target_points} Punkte"
+            if self.target_points is not None
+            else "noch auswählen"
+        )
+
+        embed = discord.Embed(
+            title="🔥 Sorare Streak Builder",
+            description=(
+                "⏳ **Analyse läuft …**"
+                if analysing
+                else "Wähle unten Punkte und Zeitraum aus."
+            ),
+        )
+
+        embed.add_field(
+            name="🏆 Wettbewerb",
+            value=self.competition_name,
+            inline=False,
+        )
+        embed.add_field(
+            name="💎 Seltenheit",
+            value=self.rarity_name,
+            inline=False,
+        )
+        embed.add_field(
+            name="🎯 Ziel",
+            value=target_text,
+            inline=False,
+        )
+
+        strategy_names = {
+            "safe": "🛡️ Safe",
+            "balanced": "⚖️ Ausgeglichen",
+            "risky": "🚀 Risky",
+        }
+        embed.add_field(
+            name="🧠 Strategie",
+            value=strategy_names.get(
+                self.strategy_mode,
+                "⚖️ Ausgeglichen",
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📅 Von",
+            value=start_display,
+            inline=False,
+        )
+        embed.add_field(
+            name="📅 Bis",
+            value=end_display,
+            inline=False,
+        )
+
+        return embed
+
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Diese Auswahl gehört zu einem anderen Nutzer.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def refresh_message(
+        self,
+        interaction: discord.Interaction,
+    ):
+        self.clear_items()
+        self.add_item(PointTargetSelect(self))
+        self.add_item(StartDateSelect(self))
+        self.add_item(EndDateSelect(self))
+        self.add_item(StrategySelect(self))
+        self.add_item(BuildTeamButton(self))
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.summary_embed(),
+            view=self,
+        )
+
 
 
 @bot.tree.command(
