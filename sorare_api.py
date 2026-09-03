@@ -42,6 +42,7 @@ PRO_COMPETITIONS = {
     "ligue1": "Ligue 1",
     "laliga": "LALIGA EA SPORTS",
     "bundesliga": "Bundesliga",
+    "mlspa": "MLS",
     "portugal": "Liga Portugal",
     "eredivisie": "Eredivisie",
     "jupiler": "Jupiler Pro League",
@@ -120,6 +121,11 @@ CONTENDER_CLASSIC_ALIASES = CONTENDER_INSEASON_ALIASES + [
 ]
 
 DEDICATED_ALIASES = {
+    "mlspa": [
+        ("mlspa", "MLS"),
+        ("mls", "MLS"),
+        ("major league soccer", "MLS"),
+    ],
     "english": [
         ("premier-league-gb-eng", "Premier League"),
         ("premier league", "Premier League"),

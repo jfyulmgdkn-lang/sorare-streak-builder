@@ -47,7 +47,7 @@ guild_object = discord.Object(id=int(GUILD_ID))
 async def on_ready():
     print(f"Bot eingeloggt als: {bot.user}")
     print("Sorare Streak Builder gestartet.")
-    print("Version: Öffentliche Streak-Auswahl + Team 1 bestes Team")
+    print("Version: MLS + harter Startelf-Filter + öffentliche Auswahl")
 
 
 
@@ -711,23 +711,23 @@ async def run_streakteam_analysis(
             card
             for card in cards
             if (
-                card.get("starter_probability") is None
-                or float(card.get("starter_probability")) >= 60.0
+                card.get("starter_probability") is not None
+                and float(card.get("starter_probability")) >= 60.0
             )
         ]
 
         removed_starter = before_starter_filter - len(cards)
         print(
             f"[Startelf-Filter] {removed_starter} Karten entfernt "
-            f"(Sorare-Startelf < 60%) | {len(cards)} übrig"
+            f"(keine Sorare-Prognose oder Startelf < 60%) | {len(cards)} übrig"
         )
 
         if not cards:
             await interaction.followup.send(
                 "❌ Nach dem Startelf-Filter ist keine spielberechtigte "
-                "Karte mehr übrig. Spieler mit einer offiziellen "
-                "Sorare-Startelfwahrscheinlichkeit unter 60% werden "
-                "nicht berücksichtigt."
+                "Karte mehr übrig. Es werden nur Spieler berücksichtigt, für die "
+                "Sorare eine offizielle Startelfwahrscheinlichkeit von "
+                "mindestens 60% liefert."
             )
             return
 
