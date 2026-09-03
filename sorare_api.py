@@ -1,4 +1,5 @@
 import os
+import random
 import asyncio
 import math
 import unicodedata
@@ -363,16 +364,27 @@ query CompetitionRecentGames($competitionSlug: String!, $after: String) {
 """
 
 
+_SORARE_REQUEST_LOCK = asyncio.Lock()
+_LAST_SORARE_REQUEST_AT = 0.0
+
+# Bewusst konservativ, damit Railway nicht in Sorare 429 läuft.
+# 0.40 s = maximal ca. 150 Requests/Minute bei serieller Ausführung.
+SORARE_MIN_REQUEST_INTERVAL = 0.40
+SORARE_MAX_RETRIES = 5
+
+
 async def sorare_request(
     query: str,
     variables: Optional[dict] = None,
     timeout_seconds: int = 60,
 ) -> dict:
+    global _LAST_SORARE_REQUEST_AT
+
     if not SORARE_API_KEY:
         raise RuntimeError("SORARE_API_KEY fehlt in der .env-Datei.")
 
     headers = {
-        "APIKEY": SORARE_API_KEY,
+        "APIKEY": SORARE_API_KEY.strip(),
         "Content-Type": "application/json",
     }
 
@@ -383,33 +395,81 @@ async def sorare_request(
 
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            SORARE_API_URL,
-            headers=headers,
-            json=payload,
-        ) as response:
-            text = await response.text()
+    for attempt in range(SORARE_MAX_RETRIES + 1):
+        # Alle Sorare-Requests dieses Prozesses werden bewusst getaktet.
+        async with _SORARE_REQUEST_LOCK:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            wait_for = (
+                SORARE_MIN_REQUEST_INTERVAL
+                - (now - _LAST_SORARE_REQUEST_AT)
+            )
 
-            if response.status != 200:
-                raise RuntimeError(
-                    f"Sorare API HTTP {response.status}: {text}"
-                )
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
 
-            data = await response.json()
+            _LAST_SORARE_REQUEST_AT = loop.time()
 
-            if data.get("errors"):
-                messages = [
-                    error.get("message", str(error))
-                    if isinstance(error, dict)
-                    else str(error)
-                    for error in data["errors"]
-                ]
-                raise RuntimeError(
-                    "Sorare GraphQL Fehler: " + " | ".join(messages)
-                )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                SORARE_API_URL,
+                headers=headers,
+                json=payload,
+            ) as response:
+                text = await response.text()
 
-            return data.get("data") or {}
+                if response.status == 429:
+                    if attempt >= SORARE_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"Sorare API HTTP 429 nach "
+                            f"{SORARE_MAX_RETRIES + 1} Versuchen: {text}"
+                        )
+
+                    retry_after_header = response.headers.get("Retry-After")
+
+                    try:
+                        retry_after = float(retry_after_header)
+                    except (TypeError, ValueError):
+                        retry_after = 0.0
+
+                    # Exponentielles Backoff: 2, 4, 8, 16, 32 Sekunden.
+                    # Etwas Zufall verhindert, dass mehrere Requests
+                    # exakt gleichzeitig erneut losschießen.
+                    backoff = max(
+                        retry_after,
+                        min(32.0, 2.0 ** (attempt + 1)),
+                    ) + random.uniform(0.15, 0.65)
+
+                    print(
+                        f"[Sorare Rate Limit] HTTP 429 | "
+                        f"Versuch {attempt + 1}/{SORARE_MAX_RETRIES + 1} | "
+                        f"warte {backoff:.1f}s"
+                    )
+
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Sorare API HTTP {response.status}: {text}"
+                    )
+
+                data = await response.json()
+
+                if data.get("errors"):
+                    messages = [
+                        error.get("message", str(error))
+                        if isinstance(error, dict)
+                        else str(error)
+                        for error in data["errors"]
+                    ]
+                    raise RuntimeError(
+                        "Sorare GraphQL Fehler: " + " | ".join(messages)
+                    )
+
+                return data.get("data") or {}
+
+    raise RuntimeError("Sorare API Anfrage unerwartet abgebrochen.")
 
 
 def normalize_text(value: Optional[str]) -> str:
@@ -649,7 +709,7 @@ async def get_player_future_games(player_slug: str) -> List[dict]:
 
 async def add_future_games_to_cards(
     cards: List[dict],
-    max_concurrent: int = 3,
+    max_concurrent: int = 1,
 ) -> List[dict]:
     unique_players = {
         card.get("player_slug")
@@ -1157,7 +1217,7 @@ async def get_player_start_probability(player_slug: str) -> Optional[dict]:
 
 async def add_start_probabilities(
     cards: List[dict],
-    max_concurrent: int = 3,
+    max_concurrent: int = 1,
 ) -> List[dict]:
     unique_players = {
         card.get("player_slug")
@@ -1354,7 +1414,7 @@ def calculate_attacking_matchup_score(
 
 async def add_clean_sheet_probabilities(
     cards: List[dict],
-    max_concurrent: int = 2,
+    max_concurrent: int = 1,
 ) -> List[dict]:
     competition_slugs = {
         (card.get("next_game") or {}).get("competition_slug")
@@ -1500,7 +1560,7 @@ async def get_player_set_piece_profile(
 
 async def add_set_piece_profiles(
     cards: List[dict],
-    max_concurrent: int = 3,
+    max_concurrent: int = 1,
 ) -> List[dict]:
     unique_players = {
         card.get("player_slug")
