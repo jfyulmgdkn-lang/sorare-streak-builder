@@ -506,6 +506,29 @@ def calculate_l40(scores: List[float]) -> float:
     return round(sum(values) / len(values), 2) if values else 0.0
 
 
+def calculate_recent_average(
+    scores: List[float],
+    last_n: int,
+) -> Optional[float]:
+    """
+    Durchschnitt der letzten verfügbaren Sorare-Rohscores.
+    rawPlayerGameScores wird von Sorare mit den jüngsten Spielen geliefert.
+    Fehlende Werte werden ignoriert.
+    """
+    values = []
+    for score in (scores or [])[:last_n]:
+        try:
+            if score is not None:
+                values.append(float(score))
+        except (TypeError, ValueError):
+            pass
+
+    if not values:
+        return None
+
+    return round(sum(values) / len(values), 2)
+
+
 def get_sorare_slug_for_discord_user(discord_user_id: int) -> Optional[str]:
     return DISCORD_TO_SORARE.get(int(discord_user_id))
 
@@ -585,6 +608,8 @@ async def get_user_cards(
                 "club_slug": club.get("slug"),
                 "club_name": club.get("name"),
                 "l40": calculate_l40(raw_scores),
+                "l5": calculate_recent_average(raw_scores, 5),
+                "l10": calculate_recent_average(raw_scores, 10),
                 "xp_bonus_pct": round(xp_bonus_pct, 2),
                 "collection_bonus_pct": round(collection_bonus_pct, 2),
                 "api_season_bonus_pct": round(api_season_bonus_pct, 2),
@@ -1646,55 +1671,141 @@ def calculate_card_rating(card: dict) -> float:
 
 
 
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def _weighted_point_projection(
+    components: List[Tuple[Optional[float], float]],
+) -> float:
+    """
+    Gewichteter Mittelwert. Fehlt ein Signal, werden die vorhandenen
+    Gewichte automatisch neu auf 100% verteilt.
+    """
+    usable = [
+        (float(value), float(weight))
+        for value, weight in components
+        if value is not None and weight > 0
+    ]
+
+    if not usable:
+        return 0.0
+
+    total_weight = sum(weight for _, weight in usable)
+    return sum(
+        value * weight
+        for value, weight in usable
+    ) / total_weight
+
+
 def estimate_player_base_points(card: dict) -> float:
     """
-    Ungefähre Sorare-Basispunkte für das kommende Spiel.
+    Verbesserte Punkte-Prognose V2.
 
-    Ausgangspunkt ist der echte L40 des Spielers.
-    Danach werden nur bereits vorhandene Signale leicht eingerechnet:
-    - offizielle Sorare-Startelfwahrscheinlichkeit
-    - Clean-Sheet-Chance bei TW/VER
-    - Offensiv-Matchup bei MID/ST
-    - Elfmeter/Ecken bei MID/ST
-    - Heim/Auswärts
+    Kern:
+    - 40% aktuelle Form (L5, geglättet mit L10)
+    - 25% L40
+    - 15% offizielle Sorare-Startelfwahrscheinlichkeit
+    - 10% Matchup
+    - 5% Heim/Auswärts
+    - 5% Standards/Rolle
 
-    Das ist bewusst eine PROGNOSE und kein garantierter Score.
+    TW/VER:
+    Das Matchup wird stattdessen stärker über die Clean-Sheet-Chance
+    abgebildet, weil diese für Defensivspieler wesentlich wichtiger ist.
+
+    Fehlende Signale werden NICHT erfunden. Die vorhandenen Gewichte
+    werden automatisch neu verteilt.
     """
-    base = float(card.get("l40") or 0.0)
+    l40 = float(card.get("l40") or 0.0)
+
+    l5 = card.get("l5")
+    l10 = card.get("l10")
+
+    # Aktuelle Form: L5 ist am wichtigsten, L10 stabilisiert Ausreißer.
+    if l5 is not None and l10 is not None:
+        recent_form = (
+            float(l5) * 0.70
+            + float(l10) * 0.30
+        )
+    elif l5 is not None:
+        recent_form = float(l5)
+    elif l10 is not None:
+        recent_form = float(l10)
+    else:
+        recent_form = None
 
     starter = card.get("starter_probability")
     if starter is not None:
-        starter = float(starter)
-        # 60% liegt etwas unter neutral, 100% nahezu ohne Abschlag.
-        starter_factor = 0.82 + (starter / 100.0) * 0.18
-        base *= starter_factor
+        # 60% (unsere Mindestgrenze) entspricht ca. 54 Punkten,
+        # 100% entspricht 70. So verbessert hohe Startelfsicherheit
+        # die Prognose, ohne den eigentlichen Sorare-Score zu dominieren.
+        starter_component = 30.0 + float(starter) * 0.40
+        starter_component = _clamp_score(starter_component)
+    else:
+        starter_component = None
+
+    game = card.get("next_game") or {}
+    home_away = game.get("home_away")
+
+    if home_away == "H":
+        venue_component = 55.0
+    elif home_away == "A":
+        venue_component = 45.0
+    else:
+        venue_component = None
 
     position = card.get("position")
-    game = card.get("next_game") or {}
 
     if position in ("TW", "VER"):
         cs = card.get("clean_sheet_probability")
-        if cs is not None:
-            # 35% ungefähr neutral.
-            base += (float(cs) - 35.0) * 0.18
 
-    if position in ("MID", "ST"):
+        if cs is not None:
+            # 35% Clean-Sheet-Chance ~= neutrales Matchup.
+            # Höhere CS-Chance hebt die erwarteten Defensivpunkte klar an.
+            defensive_matchup = _clamp_score(
+                50.0 + (float(cs) - 35.0) * 0.80
+            )
+        else:
+            defensive_matchup = None
+
+        # Bei TW/VER ist das Defensiv-Matchup wichtiger als Standards.
+        projected = _weighted_point_projection([
+            (recent_form, 40.0),
+            (l40, 25.0),
+            (starter_component, 15.0),
+            (defensive_matchup, 15.0),
+            (venue_component, 5.0),
+        ])
+
+    else:
         matchup = card.get("attacking_matchup_score")
-        if matchup is not None:
-            # 50/100 ungefähr neutral.
-            base += (float(matchup) - 50.0) * 0.12
+        matchup_component = (
+            _clamp_score(float(matchup))
+            if matchup is not None
+            else None
+        )
 
         set_piece_score = card.get("set_piece_score")
         if set_piece_score is not None:
-            # Standards sind ein Zusatzsignal, aber kein dominanter Faktor.
-            base += (float(set_piece_score) / 100.0) * 4.0
+            # Kein Standard = neutrales Signal. Gute Standards geben Upside,
+            # ohne aus einem 50er-Spieler künstlich einen 80er zu machen.
+            set_piece_component = _clamp_score(
+                50.0 + float(set_piece_score) * 0.20
+            )
+        else:
+            set_piece_component = None
 
-    if game.get("home_away") == "H":
-        base += 1.0
-    elif game.get("home_away") == "A":
-        base -= 1.0
+        projected = _weighted_point_projection([
+            (recent_form, 40.0),
+            (l40, 25.0),
+            (starter_component, 15.0),
+            (matchup_component, 10.0),
+            (venue_component, 5.0),
+            (set_piece_component, 5.0),
+        ])
 
-    return round(max(0.0, min(100.0, base)), 1)
+    return round(_clamp_score(projected), 1)
 
 
 def add_projected_points(cards: List[dict]) -> List[dict]:
