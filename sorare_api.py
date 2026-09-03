@@ -121,17 +121,18 @@ CONTENDER_CLASSIC_ALIASES = CONTENDER_INSEASON_ALIASES + [
 
 DEDICATED_ALIASES = {
     "english": [
-        ("premier league", "English League"),
-        ("premier-league", "English League"),
+        ("premier-league-gb-eng", "Premier League"),
+        ("premier league", "Premier League"),
+        ("english league", "English League"),
     ],
     "ligue1": [
+        ("ligue-1-fr", "Ligue 1"),
         ("ligue 1", "Ligue 1"),
-        ("ligue-1", "Ligue 1"),
     ],
     "laliga": [
-        ("laliga ea", "LALIGA EA SPORTS"),
-        ("laliga es", "LALIGA EA SPORTS"),
         ("laliga-es", "LALIGA EA SPORTS"),
+        ("laliga ea sports", "LALIGA EA SPORTS"),
+        ("laliga ea", "LALIGA EA SPORTS"),
         ("primera division spain", "LALIGA EA SPORTS"),
     ],
     "bundesliga": [
@@ -139,32 +140,38 @@ DEDICATED_ALIASES = {
         ("bundesliga", "Bundesliga"),
     ],
     "portugal": [
-        ("liga portugal", "Liga Portugal"),
+        ("primeira-liga-pt", "Liga Portugal"),
         ("primeira liga", "Liga Portugal"),
-        ("primeira-liga", "Liga Portugal"),
+        ("liga portugal", "Liga Portugal"),
     ],
     "eredivisie": [
         ("eredivisie", "Eredivisie"),
+        ("vriendenloterij eredivisie", "Eredivisie"),
     ],
     "jupiler": [
-        ("jupiler", "Jupiler Pro League"),
-        ("pro league", "Jupiler Pro League"),
+        ("jupiler-pro-league", "Jupiler Pro League"),
+        ("jupiler pro league", "Jupiler Pro League"),
     ],
     "scotland": [
+        ("scottish-premiership", "Scottish Premiership"),
         ("scottish premiership", "Scottish Premiership"),
         ("premiership scotland", "Scottish Premiership"),
     ],
     "jleague": [
+        ("j1-league", "J.League"),
         ("j league", "J.League"),
         ("j1 league", "J.League"),
-        ("j-league", "J.League"),
+        ("j league division 1", "J.League"),
     ],
     "championship": [
+        ("english-championship", "English Second Division"),
         ("championship", "English Second Division"),
         ("english second division", "English Second Division"),
+        ("english second division players", "English Second Division"),
         ("efl championship", "English Second Division"),
     ],
 }
+
 
 
 USER_CARDS_QUERY = """
@@ -829,6 +836,37 @@ def _match_aliases(
 
     return None
 
+
+def _match_aliases_exact(
+    competition_name: Optional[str],
+    competition_slug: Optional[str],
+    aliases: List[Tuple[str, str]],
+) -> Optional[str]:
+    """
+    Strikter Match für einzelne Liga-Auswahlen.
+
+    WICHTIG:
+    Hier gibt es KEIN Teilstring-Matching mehr.
+    Dadurch kann z.B. "Bundesliga" NICHT mehr versehentlich
+    "2. Bundesliga" treffen.
+    """
+    normalized_name = normalize_text(competition_name)
+    normalized_slug = normalize_text(competition_slug)
+
+    for needle, label in aliases:
+        candidates = {
+            normalize_text(needle),
+            normalize_text(label),
+        }
+
+        if normalized_name in candidates:
+            return label
+
+        if normalized_slug in candidates:
+            return label
+
+    return None
+
 def card_is_eligible_for_competition(
     card: dict,
     competition_key: str,
@@ -910,8 +948,20 @@ def card_is_eligible_for_competition(
 
         return False
 
+    # EINZELNE LIGA:
+    # Ab hier gilt ein harter, exakter Liga-Filter.
+    # Kein Teilstring-Matching mehr, damit sich Ligen nicht gegenseitig
+    # "fangen" können (z.B. Bundesliga vs. 2. Bundesliga).
     aliases = DEDICATED_ALIASES.get(competition_key, [])
-    return _match_aliases(name, slug, aliases) is not None
+
+    if not aliases:
+        return False
+
+    return _match_aliases_exact(
+        name,
+        slug,
+        aliases,
+    ) is not None
 
 
 
@@ -1045,11 +1095,32 @@ def filter_competition_cards(
     cards: List[dict],
     competition_key: str,
 ) -> List[dict]:
-    return [
+    filtered = [
         card
         for card in cards
         if card_is_eligible_for_competition(card, competition_key)
     ]
+
+    print(
+        f"[Liga-Filter] Auswahl={competition_key} | "
+        f"{len(filtered)}/{len(cards)} Karten zugelassen"
+    )
+
+    # Zusätzliche Diagnose: zeigt exakt, welche Domestic-League-Slugs
+    # nach dem Filter tatsächlich übrig sind.
+    remaining_leagues = Counter(
+        (
+            (card.get("next_game") or {}).get("domestic_league_slug")
+            or (card.get("next_game") or {}).get("domestic_league_name")
+            or "Unbekannt"
+        )
+        for card in filtered
+    )
+
+    for league, count in remaining_leagues.most_common():
+        print(f"[Liga-Filter]   {league}: {count}")
+
+    return filtered
 
 
 async def get_player_start_probability(player_slug: str) -> Optional[dict]:
