@@ -47,8 +47,18 @@ guild_object = discord.Object(id=int(GUILD_ID))
 async def on_ready():
     print(f"Bot eingeloggt als: {bot.user}")
     print("Sorare Streak Builder gestartet.")
-    print("Version: MLS Rare eigene Streak-Ziele + harter Startelf-Filter")
+    print("Version: Punkte-Prognose + Kartenboni + Strategie-Captain")
 
+
+@bot.tree.command(
+    name="test",
+    description="Testet, ob der Sorare Streak Builder funktioniert.",
+    guild=guild_object,
+)
+async def test(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "✅ Sorare Streak Builder funktioniert!"
+    )
 
 
 competition_choices = [
@@ -77,15 +87,11 @@ STREAK_POINT_TARGETS = {
 def get_streak_point_choices(
     competition_key: str,
     selected_value: int | None = None,
-    rarity: str | None = None,
 ):
-    if competition_key == "mlspa" and rarity == "rare":
-        values = [380, 420, 440, 460, 510]
-    else:
-        values = STREAK_POINT_TARGETS.get(
-            competition_key,
-            [320, 360, 380, 420, 440, 470],
-        )
+    values = STREAK_POINT_TARGETS.get(
+        competition_key,
+        [320, 360, 380, 420, 440, 470],
+    )
 
     return [
         discord.SelectOption(
@@ -100,15 +106,11 @@ def get_streak_point_choices(
 def get_streak_number(
     competition_key: str,
     target_points: int,
-    rarity: str | None = None,
 ) -> int:
-    if competition_key == "mlspa" and rarity == "rare":
-        values = [380, 420, 440, 460, 510]
-    else:
-        values = STREAK_POINT_TARGETS.get(
-            competition_key,
-            [320, 360, 380, 420, 440, 470],
-        )
+    values = STREAK_POINT_TARGETS.get(
+        competition_key,
+        [320, 360, 380, 420, 440, 470],
+    )
 
     try:
         return values.index(target_points) + 1
@@ -209,7 +211,6 @@ class PointTargetSelect(discord.ui.Select):
             options=get_streak_point_choices(
                 view_ref.competition_key,
                 view_ref.target_points,
-                view_ref.rarity,
             ),
             row=0,
         )
@@ -520,7 +521,7 @@ async def streakteam(
     await interaction.response.send_message(
         embed=view.summary_embed(),
         view=view,
-        ephemeral=False,
+        ephemeral=True,
     )
 
 
@@ -720,23 +721,23 @@ async def run_streakteam_analysis(
             card
             for card in cards
             if (
-                card.get("starter_probability") is not None
-                and float(card.get("starter_probability")) >= 60.0
+                card.get("starter_probability") is None
+                or float(card.get("starter_probability")) >= 60.0
             )
         ]
 
         removed_starter = before_starter_filter - len(cards)
         print(
             f"[Startelf-Filter] {removed_starter} Karten entfernt "
-            f"(keine Sorare-Prognose oder Startelf < 60%) | {len(cards)} übrig"
+            f"(Sorare-Startelf < 60%) | {len(cards)} übrig"
         )
 
         if not cards:
             await interaction.followup.send(
                 "❌ Nach dem Startelf-Filter ist keine spielberechtigte "
-                "Karte mehr übrig. Es werden nur Spieler berücksichtigt, für die "
-                "Sorare eine offizielle Startelfwahrscheinlichkeit von "
-                "mindestens 60% liefert."
+                "Karte mehr übrig. Spieler mit einer offiziellen "
+                "Sorare-Startelfwahrscheinlichkeit unter 60% werden "
+                "nicht berücksichtigt."
             )
             return
 
@@ -757,7 +758,6 @@ async def run_streakteam_analysis(
         streak_number = get_streak_number(
             competition_key,
             zielpunkte,
-            rarity,
         )
 
         # Für Streak 1-3 sollen die Spieler möglichst gleichzeitig
@@ -791,7 +791,6 @@ async def run_streakteam_analysis(
                 f"⏰ **Anstoßzeiten:** "
                 f"{'maximal 6 Stunden auseinander' if kickoff_cluster else 'werden ab Streak 4 nicht berücksichtigt'}\n"
                 f"✅ **Startelf-Filter:** Sorare-Prognose mindestens 60%\n"
-                f"🥇 **Team 1:** immer bestes mögliches Team\n"
                 f"🧠 **Strategie:** "
                 f"{'🛡️ Safe' if strategy_mode == 'safe' else ('🚀 Risky' if strategy_mode == 'risky' else '⚖️ Ausgeglichen')}\n\n"
                 f"✅ Spielberechtigte Karten: **{len(cards)}**\n"

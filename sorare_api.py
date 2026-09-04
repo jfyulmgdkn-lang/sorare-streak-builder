@@ -2486,87 +2486,118 @@ def build_four_streak_lineups(
     kickoff_cluster: bool = False,
 ) -> List[dict]:
     """
-    Baut bis zu vier komplette Teams.
+    Baut bis zu vier komplette, voneinander unabhängige Streak-Teams.
 
-    FESTE REGEL:
-    - TEAM 1 ist immer das stärkste aktuell mögliche Einzelteam.
-    - Für TEAM 1 gibt es KEIN Look-ahead und KEIN Kartensparen.
-    - Erst nachdem TEAM 1 feststeht, werden dessen Karten entfernt.
-    - TEAM 2-4 dürfen anschließend weiterhin mit Look-ahead geplant werden.
-    - dieselbe Karte wird weiterhin nur einmal verwendet.
+    NEUE REGEL:
+    - Nicht mehr zuerst Team 1 maximal stark machen und danach nur die Reste nutzen.
+    - Stattdessen werden die vier Teams GEMEINSAM geplant.
+    - Der Builder testet viele Kombinationen und maximiert die Gesamtqualität
+      aller vier Teams zusammen.
+    - Dieselbe Karte darf weiterhin nur in genau einem Team vorkommen.
+    - Wenn vier komplette Teams möglich sind, werden vier Teams bevorzugt.
+    - Erst wenn mit dem verfügbaren Kartenpool keine vier Teams möglich sind,
+      wird die bestmögliche kleinere Anzahl zurückgegeben.
+
+    Technisch wird eine Beam-Search verwendet. Dadurch bekommen wir eine
+    deutlich bessere globale Aufteilung, ohne bei großen Collections jede
+    theoretisch mögliche Kartenkombination vollständig durchrechnen zu müssen.
     """
+
     full_pool = list(cards)
-    teams_raw = []
-    used_card_slugs = set()
 
-    for team_number in range(1, 5):
-        available_pool = [
-            card
-            for card in full_pool
-            if str(card.get("card_slug") or card.get("player_slug"))
-            not in used_card_slugs
-        ]
+    # Wie viele Alternativen je Zwischenstand geprüft werden.
+    # Diese Werte sind absichtlich großzügig genug für eine gute globale Suche,
+    # aber klein genug, damit der Discord-Bot auf Railway nicht minutenlang hängt.
+    BRANCH_LIMIT = 14
+    BEAM_WIDTH = 32
 
-        candidates = _generate_lineup_candidates(
-            available_pool,
-            target_points,
-            strategy_mode,
-            kickoff_cluster,
+    def card_key(card: dict) -> str:
+        return str(card.get("card_slug") or card.get("player_slug"))
+
+    def lineup_keys(lineup: List[dict]) -> frozenset:
+        return frozenset(card_key(card) for card in lineup)
+
+    def plan_signature(plan: List[Tuple[float, List[dict]]]) -> tuple:
+        # Reihenfolge der Teams ist für die Eindeutigkeit egal.
+        return tuple(
+            sorted(
+                tuple(sorted(lineup_keys(lineup)))
+                for _, lineup in plan
+            )
         )
 
-        if not candidates:
+    # State: (Gesamtwert, Plan, verwendete Karten)
+    beam: List[Tuple[float, List[Tuple[float, List[dict]]], frozenset]] = [
+        (0.0, [], frozenset())
+    ]
+
+    best_by_depth = {0: beam[0]}
+
+    for depth in range(4):
+        expanded = []
+        seen_states = set()
+
+        for total_value, plan, used_keys in beam:
+            available_pool = [
+                card
+                for card in full_pool
+                if card_key(card) not in used_keys
+            ]
+
+            candidates = _generate_lineup_candidates(
+                available_pool,
+                target_points,
+                strategy_mode,
+                kickoff_cluster,
+            )
+
+            # Die besten unterschiedlichen Lineups dieses Zwischenstands testen.
+            for lineup_value, lineup in candidates[:BRANCH_LIMIT]:
+                keys = lineup_keys(lineup)
+
+                # Sicherheitscheck: keine Karte darf doppelt verwendet werden.
+                if keys & used_keys:
+                    continue
+
+                new_plan = plan + [(lineup_value, lineup)]
+                new_used = frozenset(set(used_keys) | set(keys))
+                new_total = total_value + float(lineup_value)
+
+                signature = (
+                    depth + 1,
+                    new_used,
+                    plan_signature(new_plan),
+                )
+                if signature in seen_states:
+                    continue
+                seen_states.add(signature)
+
+                expanded.append((new_total, new_plan, new_used))
+
+        if not expanded:
             break
 
-        if team_number == 1:
-            # WICHTIG:
-            # Der erste Kandidat ist nach _lineup_value absteigend sortiert.
-            # Team 1 bekommt daher kompromisslos das beste mögliche Team.
-            # Keine Rücksicht auf Team 2-4.
-            current_value, lineup = candidates[0]
+        # Höchster Gesamtwert aller bisher gebauten Teams gewinnt.
+        expanded.sort(key=lambda state: state[0], reverse=True)
+        beam = expanded[:BEAM_WIDTH]
+        best_by_depth[depth + 1] = beam[0]
 
-        else:
-            # Ab Team 2 darf weiterhin ein kleiner Look-ahead helfen,
-            # damit die restlichen Karten sinnvoll genutzt werden.
-            best_plan_value = float("-inf")
-            best_choice = None
+    # Wenn vier Teams möglich sind, zwingend den besten 4er-Plan nehmen.
+    # Sonst die größtmögliche Anzahl kompletter Teams.
+    best_depth = max(best_by_depth.keys())
+    _, best_plan, _ = best_by_depth[best_depth]
 
-            for current_value, candidate_lineup in candidates[:12]:
-                candidate_slugs = {
-                    str(card.get("card_slug") or card.get("player_slug"))
-                    for card in candidate_lineup
-                }
+    # Ausgabe nach Teamstärke sortieren. Dadurch ist Team 1 innerhalb des
+    # global optimierten 4er-Pakets das stärkste Team, Team 4 das schwächste.
+    best_plan = sorted(
+        best_plan,
+        key=lambda item: item[0],
+        reverse=True,
+    )
 
-                remaining_after = [
-                    card
-                    for card in available_pool
-                    if str(card.get("card_slug") or card.get("player_slug"))
-                    not in candidate_slugs
-                ]
+    teams_raw = []
 
-                future_candidates = _generate_lineup_candidates(
-                    remaining_after,
-                    target_points,
-                    strategy_mode,
-                    kickoff_cluster,
-                )
-
-                future_value = (
-                    future_candidates[0][0]
-                    if future_candidates
-                    else 0.0
-                )
-
-                plan_value = current_value + future_value * 0.72
-
-                if plan_value > best_plan_value:
-                    best_plan_value = plan_value
-                    best_choice = (current_value, candidate_lineup)
-
-            if best_choice is None:
-                break
-
-            current_value, lineup = best_choice
-
+    for team_number, (current_value, lineup) in enumerate(best_plan, start=1):
         clubs_used = Counter(
             card.get("club_name") for card in lineup
         )
@@ -2666,11 +2697,4 @@ def build_four_streak_lineups(
             "lineup_value": round(current_value, 1),
         })
 
-        # Erst JETZT werden die Karten des fest gewählten Teams gesperrt.
-        for card in lineup:
-            used_card_slugs.add(
-                str(card.get("card_slug") or card.get("player_slug"))
-            )
-
     return teams_raw
-
