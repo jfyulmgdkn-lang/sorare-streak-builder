@@ -1,1072 +1,2700 @@
 import os
-from datetime import datetime, timedelta, timezone
+import random
+import asyncio
+import math
+import unicodedata
+from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple
 
-import discord
-from discord import app_commands
-from discord.ext import commands
+import aiohttp
 from dotenv import load_dotenv
-
-from sorare_api import (
-    PRO_COMPETITIONS,
-    get_cards_for_discord_user,
-    add_future_games_to_cards,
-    select_date_range,
-    filter_competition_cards,
-    summarize_card_pool,
-    contender_inseason_diagnostics,
-    add_start_probabilities,
-    add_set_piece_profiles,
-    add_clean_sheet_probabilities,
-    add_ratings,
-    add_projected_points,
-    build_four_streak_lineups,
-)
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
+SORARE_API_URL = "https://api.sorare.com/graphql"
+SORARE_API_KEY = os.getenv("SORARE_API_KEY")
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN fehlt in der .env")
+CURRENT_SEASON_YEAR = 2026
 
-if not GUILD_ID:
-    raise RuntimeError("GUILD_ID fehlt in der .env")
+DISCORD_TO_SORARE: Dict[int, str] = {
+    652050886985777189: "adixyz",
+    486198451626049537: "bartholomaus",
+    628316534539812865: "pidel",
+    463614748366340096: "sweggaausbrazil",
+    235803999167709195: "golden_goal-699e9a95-45ec-4764-8771-a26226e5d4e9",
+    344185350161170442: "orsa-b186064b-a1fd-427c-b15a-8f47077f11ef",
+    228944337793318912: "rabise",
+    246679363502735370: "lublol",
+    1083049525830242384: "ksc_jockel",
+    209387327229919233: "once",
+    593253225973547019: "lost_drian",
+    898242220740718593: "podrickson",
+    1162305763306385441: "salapele-99",
+    712804219698282497: "kurve1887",
+    543042637087637504: "max-ntl-f9ab356a-f9e9-4a11-b76f-2a7fd50bc316",
+    376728638734860290: "fidelitas-14c9ae75-c292-474e-8608-1cc1b62d11ba",
+    344541166147993601: "cano35",
+}
 
-intents = discord.Intents.default()
+# Sorare 27: eigenständige Pro/Hot-Streak-Wettbewerbe Limited + Rare.
+PRO_COMPETITIONS = {
+    "english": "English League",
+    "ligue1": "Ligue 1",
+    "laliga": "LALIGA EA SPORTS",
+    "bundesliga": "Bundesliga",
+    "mlspa": "MLS",
+    "portugal": "Liga Portugal",
+    "eredivisie": "Eredivisie",
+    "jupiler": "Jupiler Pro League",
+    "scotland": "Scottish Premiership",
+    "jleague": "J.League",
+    "championship": "English Second Division",
+    "contender": "Contender",
+}
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-)
+# Für IN-SEASON Contender dürfen ausschließlich diese Wettbewerbe rein.
+# Wir prüfen zuerst die bekannten Sorare-Slugs und nutzen die Namen nur
+# als Fallback. Dadurch können MLS, Champions League usw. nicht mehr
+# versehentlich als Contender In-Season durchrutschen.
+CONTENDER_INSEASON_SLUGS = {
+    "2-bundesliga",
+    "austrian-bundesliga",
+    "1-hnl",
+    "ligue-2-fr",
+}
 
-guild_object = discord.Object(id=int(GUILD_ID))
-
-
-@bot.event
-async def on_ready():
-    print(f"Bot eingeloggt als: {bot.user}")
-    print("Sorare Streak Builder gestartet.")
-    print("Version: Punkte-Prognose + Kartenboni + Strategie-Captain")
-
-
-@bot.tree.command(
-    name="test",
-    description="Testet, ob der Sorare Streak Builder funktioniert.",
-    guild=guild_object,
-)
-async def test(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "✅ Sorare Streak Builder funktioniert!"
-    )
-
-
-competition_choices = [
-    app_commands.Choice(name=label, value=key)
-    for key, label in PRO_COMPETITIONS.items()
+# In-Season Contender besteht aktuell aus diesen vier Pools.
+CONTENDER_INSEASON_ALIASES = [
+    ("2 bundesliga", "2. Bundesliga"),
+    ("2-bundesliga", "2. Bundesliga"),
+    ("2 bundesliga de", "2. Bundesliga"),
+    ("austrian bundesliga", "Austrian Bundesliga"),
+    ("austrian-bundesliga", "Austrian Bundesliga"),
+    ("bundesliga at", "Austrian Bundesliga"),
+    ("1 hnl", "SuperSport HNL"),
+    ("1-hnl", "SuperSport HNL"),
+    ("supersport hnl", "SuperSport HNL"),
+    ("hnl", "SuperSport HNL"),
+    ("croatian", "SuperSport HNL"),
+    ("ligue 2", "Ligue 2 BKT"),
+    ("ligue-2", "Ligue 2 BKT"),
+    ("ligue 2 fr", "Ligue 2 BKT"),
+    ("ligue-2-fr", "Ligue 2 BKT"),
 ]
 
+# Vom Nutzer gewünschter Classic-Pool für den einen möglichen Classic-Slot
+# in Contender. Zusätzlich sind die vier In-Season-Contender-Ligen erlaubt.
+CONTENDER_CLASSIC_ALIASES = CONTENDER_INSEASON_ALIASES + [
+    ("laliga hypermotion", "LALIGA HYPERMOTION"),
+    ("segunda division", "LALIGA HYPERMOTION"),
+    ("laliga-2", "LALIGA HYPERMOTION"),
+    ("super lig", "Süper Lig"),
+    ("turkey", "Süper Lig"),
+    ("serie a", "Serie A"),
+    ("superliga argentina", "Superliga Argentina de Fútbol"),
+    ("argentina", "Superliga Argentina de Fútbol"),
+    ("liga mx", "Liga MX"),
+    ("mexico", "Liga MX"),
+    ("brasileirao", "Campeonato Brasileiro Série A"),
+    ("brasileiro serie a", "Campeonato Brasileiro Série A"),
+    ("brazil", "Campeonato Brasileiro Série A"),
+    ("serie b", "Serie B"),
+    ("danish superliga", "Danish Superliga"),
+    ("superliga dk", "Danish Superliga"),
+    ("denmark", "Danish Superliga"),
+    ("eliteserien", "Eliteserien"),
+    ("norway", "Eliteserien"),
+    ("super league", "Super League"),
+    ("greece", "Super League"),
+    ("russian premier league", "Russian Premier League"),
+    ("russia", "Russian Premier League"),
+    ("primera a", "Primera A"),
+    ("colombia", "Primera A"),
+    ("primera division del peru", "Primera División del Perú"),
+    ("peru", "Primera División del Perú"),
+    ("primera division de chile", "Primera División de Chile"),
+    ("chile", "Primera División de Chile"),
+    ("liga pro", "Liga Pro"),
+    ("ecuador", "Liga Pro"),
+    ("chinese super league", "Chinese Super League"),
+    ("china", "Chinese Super League"),
+]
 
-
-STREAK_POINT_TARGETS = {
-    "bundesliga-de": [320, 360, 380, 420, 440, 470],
-    "2-bundesliga": [320, 360, 380, 420, 440, 470],
-    "premier-league-gb-eng": [320, 360, 380, 400, 430, 450],
-    "laliga-es": [320, 360, 380, 420, 440, 470],
-    "ligue-1-fr": [320, 360, 380, 410, 440, 460],
-    "ligue-2-fr": [320, 360, 380, 420, 440, 470],
-    "mlspa": [340, 380, 400, 420, 460],
-    "austrian-bundesliga": [320, 360, 380, 420, 440, 470],
-    "1-hnl": [320, 360, 380, 420, 440, 470],
-    "primeira-liga-pt": [320, 360, 380, 410, 440, 460],
-    "jupiler-pro-league": [320, 360, 380, 410, 440, 460],
-    "contender": [320, 360, 380, 420, 440, 470],
+DEDICATED_ALIASES = {
+    "mlspa": [
+        ("mlspa", "MLS"),
+        ("mls", "MLS"),
+        ("major league soccer", "MLS"),
+    ],
+    "english": [
+        ("premier-league-gb-eng", "Premier League"),
+        ("premier league", "Premier League"),
+        ("english league", "English League"),
+    ],
+    "ligue1": [
+        ("ligue-1-fr", "Ligue 1"),
+        ("ligue 1", "Ligue 1"),
+    ],
+    "laliga": [
+        ("laliga-es", "LALIGA EA SPORTS"),
+        ("laliga ea sports", "LALIGA EA SPORTS"),
+        ("laliga ea", "LALIGA EA SPORTS"),
+        ("primera division spain", "LALIGA EA SPORTS"),
+    ],
+    "bundesliga": [
+        ("bundesliga-de", "Bundesliga"),
+        ("bundesliga", "Bundesliga"),
+    ],
+    "portugal": [
+        ("primeira-liga-pt", "Liga Portugal"),
+        ("primeira liga", "Liga Portugal"),
+        ("liga portugal", "Liga Portugal"),
+    ],
+    "eredivisie": [
+        ("eredivisie", "Eredivisie"),
+        ("vriendenloterij eredivisie", "Eredivisie"),
+    ],
+    "jupiler": [
+        ("jupiler-pro-league", "Jupiler Pro League"),
+        ("jupiler pro league", "Jupiler Pro League"),
+    ],
+    "scotland": [
+        ("scottish-premiership", "Scottish Premiership"),
+        ("scottish premiership", "Scottish Premiership"),
+        ("premiership scotland", "Scottish Premiership"),
+    ],
+    "jleague": [
+        ("j1-league", "J.League"),
+        ("j league", "J.League"),
+        ("j1 league", "J.League"),
+        ("j league division 1", "J.League"),
+    ],
+    "championship": [
+        ("english-championship", "English Second Division"),
+        ("championship", "English Second Division"),
+        ("english second division", "English Second Division"),
+        ("english second division players", "English Second Division"),
+        ("efl championship", "English Second Division"),
+    ],
 }
 
 
-def get_streak_point_choices(
-    competition_key: str,
-    selected_value: int | None = None,
-):
-    values = STREAK_POINT_TARGETS.get(
-        competition_key,
-        [320, 360, 380, 420, 440, 470],
+
+USER_CARDS_QUERY = """
+query UserCards($userSlug: String!, $after: String) {
+  user(slug: $userSlug) {
+    slug
+    nickname
+
+    cards(first: 100, after: $after) {
+      nodes {
+        slug
+        rarityTyped
+        seasonYear
+
+        ... on Card {
+          positionTyped
+          inSeasonEligible
+          powerBreakdown {
+            xpBasisPoints
+            seasonBasisPoints
+            collectionBasisPoints
+          }
+        }
+
+        anyPlayer {
+          slug
+          displayName
+          activeClub {
+            slug
+            name
+          }
+
+          ... on Player {
+            rawPlayerGameScores(last: 40)
+          }
+        }
+      }
+
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"""
+
+
+
+
+FUTURE_GAMES_QUERY = """
+query PlayerFutureGames($playerSlug: String!) {
+  anyPlayer(slug: $playerSlug) {
+    slug
+
+    anyFutureGames(first: 12) {
+      nodes {
+        date
+
+        homeTeam {
+          slug
+          name
+        }
+
+        awayTeam {
+          slug
+          name
+        }
+
+        so5Fixture {
+          slug
+          gameWeek
+          shortDisplayName
+          longDisplayName
+          startDate
+          endDate
+        }
+
+        ... on Game {
+          id
+          competition {
+            slug
+            displayName
+          }
+        }
+      }
+    }
+
+    ... on Player {
+      activeClub {
+        slug
+        name
+        domesticLeague {
+          slug
+          displayName
+        }
+      }
+    }
+  }
+}
+"""
+
+
+
+PLAYER_SET_PIECE_QUERY = """
+query PlayerSetPieces($playerSlug: String!) {
+  anyPlayer(slug: $playerSlug) {
+    slug
+
+    ... on Player {
+      allPlayerGameScores(last: 15) {
+        nodes {
+          ... on PlayerGameScore {
+            anyPlayerGameStats {
+              ... on PlayerGameStats {
+                gameStarted
+                minsPlayed
+                penaltyTaken
+                cornerTaken
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+STARTER_ODDS_QUERY = """
+query StarterOdds($playerSlug: String!) {
+  players(slugs: [$playerSlug]) {
+    slug
+
+    ... on Player {
+      nextClassicFixturePlayingStatusOdds {
+        starterOddsBasisPoints
+        substituteOddsBasisPoints
+        nonPlayingOddsBasisPoints
+        reliability
+      }
+    }
+  }
+}
+"""
+
+
+COMPETITION_RECENT_GAMES_QUERY = """
+query CompetitionRecentGames($competitionSlug: String!, $after: String) {
+  football {
+    competition(slug: $competitionSlug) {
+      slug
+      displayName
+
+      pastGames(first: 100, after: $after) {
+        nodes {
+          id
+          date
+          statusTyped
+          homeScore
+          awayScore
+
+          homeTeam {
+            slug
+            name
+          }
+
+          awayTeam {
+            slug
+            name
+          }
+        }
+
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}
+"""
+
+
+_SORARE_REQUEST_LOCK = asyncio.Lock()
+_LAST_SORARE_REQUEST_AT = 0.0
+
+# Bewusst konservativ, damit Railway nicht in Sorare 429 läuft.
+# 0.40 s = maximal ca. 150 Requests/Minute bei serieller Ausführung.
+SORARE_MIN_REQUEST_INTERVAL = 0.40
+SORARE_MAX_RETRIES = 5
+
+
+async def sorare_request(
+    query: str,
+    variables: Optional[dict] = None,
+    timeout_seconds: int = 60,
+) -> dict:
+    global _LAST_SORARE_REQUEST_AT
+
+    if not SORARE_API_KEY:
+        raise RuntimeError("SORARE_API_KEY fehlt in der .env-Datei.")
+
+    headers = {
+        "APIKEY": SORARE_API_KEY.strip(),
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "query": query,
+        "variables": variables or {},
+    }
+
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+
+    for attempt in range(SORARE_MAX_RETRIES + 1):
+        # Alle Sorare-Requests dieses Prozesses werden bewusst getaktet.
+        async with _SORARE_REQUEST_LOCK:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            wait_for = (
+                SORARE_MIN_REQUEST_INTERVAL
+                - (now - _LAST_SORARE_REQUEST_AT)
+            )
+
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+
+            _LAST_SORARE_REQUEST_AT = loop.time()
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                SORARE_API_URL,
+                headers=headers,
+                json=payload,
+            ) as response:
+                text = await response.text()
+
+                if response.status == 429:
+                    if attempt >= SORARE_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"Sorare API HTTP 429 nach "
+                            f"{SORARE_MAX_RETRIES + 1} Versuchen: {text}"
+                        )
+
+                    retry_after_header = response.headers.get("Retry-After")
+
+                    try:
+                        retry_after = float(retry_after_header)
+                    except (TypeError, ValueError):
+                        retry_after = 0.0
+
+                    # Exponentielles Backoff: 2, 4, 8, 16, 32 Sekunden.
+                    # Etwas Zufall verhindert, dass mehrere Requests
+                    # exakt gleichzeitig erneut losschießen.
+                    backoff = max(
+                        retry_after,
+                        min(32.0, 2.0 ** (attempt + 1)),
+                    ) + random.uniform(0.15, 0.65)
+
+                    print(
+                        f"[Sorare Rate Limit] HTTP 429 | "
+                        f"Versuch {attempt + 1}/{SORARE_MAX_RETRIES + 1} | "
+                        f"warte {backoff:.1f}s"
+                    )
+
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Sorare API HTTP {response.status}: {text}"
+                    )
+
+                data = await response.json()
+
+                if data.get("errors"):
+                    messages = [
+                        error.get("message", str(error))
+                        if isinstance(error, dict)
+                        else str(error)
+                        for error in data["errors"]
+                    ]
+                    raise RuntimeError(
+                        "Sorare GraphQL Fehler: " + " | ".join(messages)
+                    )
+
+                return data.get("data") or {}
+
+    raise RuntimeError("Sorare API Anfrage unerwartet abgebrochen.")
+
+
+def normalize_text(value: Optional[str]) -> str:
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return " ".join(
+        text.lower()
+        .replace("_", " ")
+        .replace("-", " ")
+        .replace(".", " ")
+        .split()
     )
 
-    return [
-        discord.SelectOption(
-            label=f"{value} Punkte",
-            value=str(value),
-            default=(selected_value == value),
+
+def normalize_position(position: Optional[str]) -> str:
+    mapping = {
+        "Goalkeeper": "TW",
+        "Defender": "VER",
+        "Midfielder": "MID",
+        "Forward": "ST",
+    }
+    return mapping.get(position or "", position or "?")
+
+
+def calculate_l40(scores: List[float]) -> float:
+    values = []
+    for score in scores or []:
+        try:
+            if score is not None:
+                values.append(float(score))
+        except (TypeError, ValueError):
+            pass
+
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def calculate_recent_average(
+    scores: List[float],
+    last_n: int,
+) -> Optional[float]:
+    """
+    Durchschnitt der letzten verfügbaren Sorare-Rohscores.
+    rawPlayerGameScores wird von Sorare mit den jüngsten Spielen geliefert.
+    Fehlende Werte werden ignoriert.
+    """
+    values = []
+    for score in (scores or [])[:last_n]:
+        try:
+            if score is not None:
+                values.append(float(score))
+        except (TypeError, ValueError):
+            pass
+
+    if not values:
+        return None
+
+    return round(sum(values) / len(values), 2)
+
+
+def get_sorare_slug_for_discord_user(discord_user_id: int) -> Optional[str]:
+    return DISCORD_TO_SORARE.get(int(discord_user_id))
+
+
+async def get_user_cards(
+    user_slug: str,
+    rarity: str,
+) -> dict:
+    after = None
+    user_info = None
+    cards: List[dict] = []
+    rarity = rarity.lower()
+    page = 0
+
+    while True:
+        page += 1
+        data = await sorare_request(
+            USER_CARDS_QUERY,
+            {"userSlug": user_slug, "after": after},
         )
-        for value in values
-    ]
+
+        user = data.get("user")
+        if not user:
+            return {"user": None, "cards": []}
+
+        if user_info is None:
+            user_info = {
+                "slug": user.get("slug"),
+                "nickname": user.get("nickname"),
+            }
+
+        connection = user.get("cards") or {}
+        nodes = connection.get("nodes") or []
+
+        for card in nodes:
+            card_rarity = str(card.get("rarityTyped") or "").lower()
+            if card_rarity != rarity:
+                continue
+
+            player = card.get("anyPlayer") or {}
+            club = player.get("activeClub") or {}
+            raw_scores = player.get("rawPlayerGameScores") or []
+            power_breakdown = card.get("powerBreakdown") or {}
+
+            # Sorare liefert die Bonuswerte in Basis Points:
+            # 100 Basis Points = 1,00%.
+            xp_bonus_pct = (
+                float(power_breakdown.get("xpBasisPoints") or 0) / 100.0
+            )
+            collection_bonus_pct = (
+                float(power_breakdown.get("collectionBasisPoints") or 0) / 100.0
+            )
+
+            # Season-Bonus laut Sorare API. Falls die API an dieser Stelle
+            # wider Erwarten 0 liefert, gilt für unsere In-Season-Karte
+            # weiterhin die vom Nutzer gewünschte 5%-Regel.
+            api_season_bonus_pct = (
+                float(power_breakdown.get("seasonBasisPoints") or 0) / 100.0
+            )
+
+            cards.append({
+                "card_slug": card.get("slug"),
+                "rarity": card.get("rarityTyped"),
+                "season_year": card.get("seasonYear"),
+                "api_in_season_eligible": bool(card.get("inSeasonEligible")),
+                # Für 2026/27 behandeln wir Karten der Saison 2026 als
+                # aktuelle Saison. Die tatsächliche Contender-In-Season-
+                # Berechtigung wird beim Wettbewerbsfilter zusätzlich über
+                # inSeasonEligible geprüft.
+                "current_season_card": card.get("seasonYear") == CURRENT_SEASON_YEAR,
+                "in_season": card.get("seasonYear") == CURRENT_SEASON_YEAR,
+                "classic": card.get("seasonYear") != CURRENT_SEASON_YEAR,
+                "position_raw": card.get("positionTyped"),
+                "position": normalize_position(card.get("positionTyped")),
+                "player_slug": player.get("slug"),
+                "player_name": player.get("displayName"),
+                "club_slug": club.get("slug"),
+                "club_name": club.get("name"),
+                "l40": calculate_l40(raw_scores),
+                "l5": calculate_recent_average(raw_scores, 5),
+                "l10": calculate_recent_average(raw_scores, 10),
+                "xp_bonus_pct": round(xp_bonus_pct, 2),
+                "collection_bonus_pct": round(collection_bonus_pct, 2),
+                "api_season_bonus_pct": round(api_season_bonus_pct, 2),
+            })
+
+        page_info = connection.get("pageInfo") or {}
+
+        print(
+            f"[Karten Seite {page}] {len(nodes)} geprüft | "
+            f"{len(cards)} {rarity.title()}-Karten gefunden"
+        )
+
+        if not page_info.get("hasNextPage"):
+            break
+
+        after = page_info.get("endCursor")
+        if not after:
+            break
+
+        await asyncio.sleep(0.08)
+
+    return {"user": user_info, "cards": cards}
 
 
-def get_streak_number(
-    competition_key: str,
-    target_points: int,
-) -> int:
-    values = STREAK_POINT_TARGETS.get(
-        competition_key,
-        [320, 360, 380, 420, 440, 470],
+async def get_cards_for_discord_user(
+    discord_user_id: int,
+    rarity: str,
+) -> dict:
+    sorare_slug = get_sorare_slug_for_discord_user(discord_user_id)
+
+    if not sorare_slug:
+        return {
+            "user": None,
+            "cards": [],
+            "sorare_slug": None,
+            "error": "DISCORD_USER_NOT_MAPPED",
+        }
+
+    result = await get_user_cards(sorare_slug, rarity)
+    result["sorare_slug"] = sorare_slug
+    result["error"] = None
+    return result
+
+
+
+async def get_player_future_games(player_slug: str) -> List[dict]:
+    """
+    Lädt mehrere zukünftige Spiele eines Spielers.
+    Dadurch können wir im Discord zwischen der nächsten und der
+    darauffolgenden GameWeek auswählen.
+    """
+    data = await sorare_request(
+        FUTURE_GAMES_QUERY,
+        {"playerSlug": player_slug},
     )
+
+    player = data.get("anyPlayer")
+    if not player:
+        return []
+
+    club = player.get("activeClub") or {}
+    club_slug = club.get("slug")
+    domestic_league = club.get("domesticLeague") or {}
+
+    connection = player.get("anyFutureGames") or {}
+    nodes = connection.get("nodes") or []
+
+    result = []
+
+    for game in nodes:
+        fixture = game.get("so5Fixture") or {}
+        fixture_slug = fixture.get("slug")
+
+        # Nur echte Sorare-Classic-Fixtures.
+        if not fixture_slug:
+            continue
+
+        home = game.get("homeTeam") or {}
+        away = game.get("awayTeam") or {}
+
+        if club_slug == home.get("slug"):
+            home_away = "H"
+            opponent = away
+        elif club_slug == away.get("slug"):
+            home_away = "A"
+            opponent = home
+        else:
+            home_away = "?"
+            opponent = {}
+
+        competition = game.get("competition") or {}
+
+        result.append({
+            "game_id": game.get("id"),
+            "date": game.get("date"),
+            "home_away": home_away,
+            "team_slug": club_slug,
+            "team_name": club.get("name"),
+            "domestic_league_slug": domestic_league.get("slug"),
+            "domestic_league_name": domestic_league.get("displayName"),
+            "opponent_slug": opponent.get("slug"),
+            "opponent_name": opponent.get("name"),
+            "competition_slug": competition.get("slug"),
+            "competition_name": competition.get("displayName"),
+            "fixture_slug": fixture_slug,
+            "game_week": fixture.get("gameWeek"),
+            "fixture_short_name": fixture.get("shortDisplayName"),
+            "fixture_long_name": fixture.get("longDisplayName"),
+            "fixture_start": fixture.get("startDate"),
+            "fixture_end": fixture.get("endDate"),
+        })
+
+    result.sort(
+        key=lambda row: (
+            row.get("fixture_start") or "9999",
+            row.get("date") or "9999",
+        )
+    )
+
+    return result
+
+
+async def add_future_games_to_cards(
+    cards: List[dict],
+    max_concurrent: int = 1,
+) -> List[dict]:
+    unique_players = {
+        card.get("player_slug")
+        for card in cards
+        if card.get("player_slug")
+    }
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    cache: Dict[str, List[dict]] = {}
+
+    async def load_one(slug: str):
+        async with semaphore:
+            try:
+                cache[slug] = await get_player_future_games(slug)
+            except Exception as exc:
+                print(f"[Zukünftige Spiele] {slug}: {exc}")
+                cache[slug] = []
+
+            await asyncio.sleep(0.04)
+
+    await asyncio.gather(
+        *(load_one(slug) for slug in unique_players)
+    )
+
+    enriched = []
+
+    for card in cards:
+        item = dict(card)
+        item["future_games"] = cache.get(
+            card.get("player_slug"),
+            [],
+        )
+        enriched.append(item)
+
+    return enriched
+
+
+def get_available_game_weeks(cards: List[dict]) -> List[dict]:
+    """
+    Sammelt alle unterschiedlichen zukünftigen SO5-Fixtures aus den
+    Karten des Nutzers. Nur GameWeeks, in denen mindestens ein eigener
+    Spieler ein Spiel hat, erscheinen.
+    """
+    fixtures: Dict[str, dict] = {}
+
+    for card in cards:
+        for game in card.get("future_games") or []:
+            slug = game.get("fixture_slug")
+            start = game.get("fixture_start")
+
+            if not slug or not start:
+                continue
+
+            if slug not in fixtures:
+                fixtures[slug] = {
+                    "slug": slug,
+                    "game_week": game.get("game_week"),
+                    "short_name": game.get("fixture_short_name"),
+                    "long_name": game.get("fixture_long_name"),
+                    "start_date": start,
+                    "end_date": game.get("fixture_end"),
+                    "player_count": 0,
+                }
+
+            fixtures[slug]["player_count"] += 1
+
+    result = list(fixtures.values())
+    result.sort(
+        key=lambda row: row.get("start_date") or "9999"
+    )
+    return result
+
+
+def _parse_sorare_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
 
     try:
-        return values.index(target_points) + 1
-    except ValueError:
-        return 99
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
 
 
-WEEKDAYS_DE = [
-    "Mo",
-    "Di",
-    "Mi",
-    "Do",
-    "Fr",
-    "Sa",
-    "So",
-]
-
-
-def build_date_options(
-    default_offset: int = 0,
-    selected_date: str | None = None,
-):
+def select_date_range(
+    cards: List[dict],
+    start_date: str,
+    end_date: str,
+) -> Tuple[List[dict], List[dict]]:
     """
-    Discord erlaubt maximal 25 Einträge pro Select-Menü.
-    Deshalb zeigen wir heute + die nächsten 20 Tage an.
+    Wählt alle Spieler, die mindestens ein SO5-eligible Spiel im
+    gewünschten Zeitraum haben.
+
+    start_date/end_date müssen YYYY-MM-DD sein.
+
+    Zeitraum:
+      Starttag 00:00 UTC
+      Endtag   23:59:59 UTC
+
+    Hat ein Spieler mehrere Spiele im Zeitraum, wird für die aktuelle
+    Bewertung das zeitlich erste Spiel verwendet. Alle gefundenen Spiele
+    bleiben zusätzlich unter games_in_range gespeichert.
     """
-    today = datetime.now(timezone.utc).date()
-    options = []
-
-    for offset in range(21):
-        day = today + timedelta(days=offset)
-        weekday = WEEKDAYS_DE[day.weekday()]
-        label = f"{weekday}, {day.strftime('%d.%m.%Y')}"
-
-        is_default = (
-            day.isoformat() == selected_date
-            if selected_date is not None
-            else offset == default_offset
-        )
-
-        options.append(
-            discord.SelectOption(
-                label=label,
-                value=day.isoformat(),
-                default=is_default,
-            )
-        )
-
-    return options
-
-
-class StartDateSelect(discord.ui.Select):
-    def __init__(self, view_ref):
-        self.view_ref = view_ref
-        super().__init__(
-            placeholder="📅 Von-Datum auswählen",
-            min_values=1,
-            max_values=1,
-            options=build_date_options(
-                default_offset=0,
-                selected_date=view_ref.start_date,
-            ),
-            row=1,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.start_date = self.values[0]
-        await self.view_ref.refresh_message(interaction)
-
-
-class EndDateSelect(discord.ui.Select):
-    def __init__(self, view_ref):
-        self.view_ref = view_ref
-        super().__init__(
-            placeholder="📅 Bis-Datum auswählen",
-            min_values=1,
-            max_values=1,
-            options=build_date_options(
-                default_offset=4,
-                selected_date=view_ref.end_date,
-            ),
-            row=2,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.end_date = self.values[0]
-        await self.view_ref.refresh_message(interaction)
-
-
-
-class PointTargetSelect(discord.ui.Select):
-    def __init__(self, view_ref):
-        self.view_ref = view_ref
-        super().__init__(
-            placeholder="🎯 Streak-Punkteziel auswählen",
-            min_values=1,
-            max_values=1,
-            options=get_streak_point_choices(
-                view_ref.competition_key,
-                view_ref.target_points,
-            ),
-            row=0,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.target_points = int(self.values[0])
-        await self.view_ref.refresh_message(interaction)
-
-
-class StrategySelect(discord.ui.Select):
-    def __init__(self, view_ref):
-        self.view_ref = view_ref
-
-        labels = {
-            "safe": "🛡️ Safe",
-            "balanced": "⚖️ Ausgeglichen",
-            "risky": "🚀 Risky",
-        }
-
-        descriptions = {
-            "safe": "Mehr Startelf-Sicherheit, Clean Sheet und Stacking",
-            "balanced": "Ausgewogene Mischung aus Sicherheit und Qualität",
-            "risky": "Mehr Einzelqualität und offensive Upside",
-        }
-
-        options = [
-            discord.SelectOption(
-                label=labels[value],
-                value=value,
-                description=descriptions[value],
-                default=(view_ref.strategy_mode == value),
-            )
-            for value in ("safe", "balanced", "risky")
-        ]
-
-        super().__init__(
-            placeholder="🧠 Strategie auswählen",
-            min_values=1,
-            max_values=1,
-            options=options,
-            row=3,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.strategy_mode = self.values[0]
-        await self.view_ref.refresh_message(interaction)
-
-
-class BuildTeamButton(discord.ui.Button):
-    def __init__(self, view_ref):
-        self.view_ref = view_ref
-        super().__init__(
-            label="Team bauen",
-            style=discord.ButtonStyle.green,
-            emoji="🔥",
-            row=4,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if self.view_ref.target_points is None:
-            await interaction.response.send_message(
-                "❌ Bitte zuerst dein Streak-Punkteziel auswählen.",
-                ephemeral=True,
-            )
-            return
-
+    try:
         start_dt = datetime.strptime(
-            self.view_ref.start_date,
+            start_date,
             "%Y-%m-%d",
-        ).date()
+        ).replace(tzinfo=timezone.utc)
 
         end_dt = datetime.strptime(
-            self.view_ref.end_date,
+            end_date,
             "%Y-%m-%d",
-        ).date()
-
-        if end_dt < start_dt:
-            await interaction.response.send_message(
-                "❌ Das Bis-Datum darf nicht vor dem Von-Datum liegen.",
-                ephemeral=True,
-            )
-            return
-
-        for item in self.view_ref.children:
-            item.disabled = True
-
-        await interaction.response.edit_message(
-            content=None,
-            embed=self.view_ref.summary_embed(analysing=True),
-            view=self.view_ref,
+        ).replace(
+            hour=23,
+            minute=59,
+            second=59,
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        raise ValueError(
+            "Datum bitte im Format YYYY-MM-DD eingeben, "
+            "z. B. 2026-09-04."
         )
 
-        await run_streakteam_analysis(
-            interaction=interaction,
-            competition_key=self.view_ref.competition_key,
-            competition_name=self.view_ref.competition_name,
-            rarity=self.view_ref.rarity,
-            rarity_name=self.view_ref.rarity_name,
-            zielpunkte=self.view_ref.target_points,
-            strategy_mode=self.view_ref.strategy_mode,
-            von=self.view_ref.start_date,
-            bis=self.view_ref.end_date,
+    if end_dt < start_dt:
+        raise ValueError(
+            "Das Bis-Datum darf nicht vor dem Von-Datum liegen."
         )
 
+    filtered = []
+    fixtures: Dict[str, dict] = {}
 
-class DateRangeView(discord.ui.View):
-    def __init__(
-        self,
-        owner_id: int,
-        competition_key: str,
-        competition_name: str,
-        rarity: str,
-        rarity_name: str,
-    ):
-        super().__init__(timeout=300)
+    for card in cards:
+        matching_games = []
 
-        today = datetime.now(timezone.utc).date()
+        for game in card.get("future_games") or []:
+            game_dt = _parse_sorare_datetime(game.get("date"))
+            if game_dt is None:
+                continue
 
-        self.owner_id = owner_id
-        self.competition_key = competition_key
-        self.competition_name = competition_name
-        self.rarity = rarity
-        self.rarity_name = rarity_name
-        self.target_points = None
-        self.strategy_mode = "balanced"
+            if start_dt <= game_dt <= end_dt:
+                matching_games.append(game)
 
-        self.start_date = today.isoformat()
-        self.end_date = (today + timedelta(days=4)).isoformat()
+                fixture_slug = game.get("fixture_slug")
+                if fixture_slug and fixture_slug not in fixtures:
+                    fixtures[fixture_slug] = {
+                        "slug": fixture_slug,
+                        "game_week": game.get("game_week"),
+                        "short_name": game.get("fixture_short_name"),
+                        "long_name": game.get("fixture_long_name"),
+                        "start_date": game.get("fixture_start"),
+                        "end_date": game.get("fixture_end"),
+                    }
 
-        self.add_item(PointTargetSelect(self))
-        self.add_item(StartDateSelect(self))
-        self.add_item(EndDateSelect(self))
-        self.add_item(StrategySelect(self))
-        self.add_item(BuildTeamButton(self))
+        if not matching_games:
+            continue
 
-    def summary_text(self):
-        start_display = datetime.strptime(
-            self.start_date,
-            "%Y-%m-%d",
-        ).strftime("%d.%m.%Y")
-
-        end_display = datetime.strptime(
-            self.end_date,
-            "%Y-%m-%d",
-        ).strftime("%d.%m.%Y")
-
-        target_text = (
-            f"{self.target_points} Punkte"
-            if self.target_points is not None
-            else "noch auswählen"
+        matching_games.sort(
+            key=lambda game: game.get("date") or "9999"
         )
 
-        return (
-            "🔥 **Sorare Streak Builder**\n"
-            "\n"
-            f"🏆 **Wettbewerb:** {self.competition_name}\n"
-            f"💎 **Seltenheit:** {self.rarity_name}\n"
-            f"🎯 **Ziel:** {target_text}\n"
-            f"📅 **Von:** {start_display}\n"
-            f"📅 **Bis:** {end_display}\n"
-            "\n"
-            "👇 **Auswahl unten:**\n"
-            "1. 🎯 Streak-Punkteziel\n"
-            "2. 📅 Von-Datum\n"
-            "3. 📅 Bis-Datum\n"
-            "4. 🔥 Team bauen"
-        )
+        item = dict(card)
+        item["games_in_range"] = matching_games
+        item["next_game"] = matching_games[0]
+        filtered.append(item)
+
+    fixture_list = list(fixtures.values())
+    fixture_list.sort(
+        key=lambda row: row.get("start_date") or "9999"
+    )
+
+    return filtered, fixture_list
 
 
-    def summary_embed(self, analysing: bool = False):
-        start_display = datetime.strptime(
-            self.start_date,
-            "%Y-%m-%d",
-        ).strftime("%d.%m.%Y")
+def _match_aliases(
+    competition_name: Optional[str],
+    competition_slug: Optional[str],
+    aliases: List[Tuple[str, str]],
+) -> Optional[str]:
+    haystack = (
+        normalize_text(competition_name)
+        + " "
+        + normalize_text(competition_slug)
+    )
 
-        end_display = datetime.strptime(
-            self.end_date,
-            "%Y-%m-%d",
-        ).strftime("%d.%m.%Y")
+    for needle, label in aliases:
+        if normalize_text(needle) in haystack:
+            return label
 
-        target_text = (
-            f"{self.target_points} Punkte"
-            if self.target_points is not None
-            else "noch auswählen"
-        )
+    return None
 
-        embed = discord.Embed(
-            title="🔥 Sorare Streak Builder",
-            description=(
-                "⏳ **Analyse läuft …**"
-                if analysing
-                else "Wähle unten Punkte und Zeitraum aus."
-            ),
-        )
 
-        embed.add_field(
-            name="🏆 Wettbewerb",
-            value=self.competition_name,
-            inline=False,
-        )
-        embed.add_field(
-            name="💎 Seltenheit",
-            value=self.rarity_name,
-            inline=False,
-        )
-        embed.add_field(
-            name="🎯 Ziel",
-            value=target_text,
-            inline=False,
-        )
+def _match_aliases_exact(
+    competition_name: Optional[str],
+    competition_slug: Optional[str],
+    aliases: List[Tuple[str, str]],
+) -> Optional[str]:
+    """
+    Strikter Match für einzelne Liga-Auswahlen.
 
-        strategy_names = {
-            "safe": "🛡️ Safe",
-            "balanced": "⚖️ Ausgeglichen",
-            "risky": "🚀 Risky",
+    WICHTIG:
+    Hier gibt es KEIN Teilstring-Matching mehr.
+    Dadurch kann z.B. "Bundesliga" NICHT mehr versehentlich
+    "2. Bundesliga" treffen.
+    """
+    normalized_name = normalize_text(competition_name)
+    normalized_slug = normalize_text(competition_slug)
+
+    for needle, label in aliases:
+        candidates = {
+            normalize_text(needle),
+            normalize_text(label),
         }
-        embed.add_field(
-            name="🧠 Strategie",
-            value=strategy_names.get(
-                self.strategy_mode,
-                "⚖️ Ausgeglichen",
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="📅 Von",
-            value=start_display,
-            inline=False,
-        )
-        embed.add_field(
-            name="📅 Bis",
-            value=end_display,
-            inline=False,
-        )
 
-        return embed
+        if normalized_name in candidates:
+            return label
 
+        if normalized_slug in candidates:
+            return label
 
-    async def interaction_check(
-        self,
-        interaction: discord.Interaction,
-    ) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "❌ Diese Auswahl gehört zu einem anderen Nutzer.",
-                ephemeral=True,
-            )
-            return False
-        return True
+    return None
 
-    async def refresh_message(
-        self,
-        interaction: discord.Interaction,
-    ):
-        self.clear_items()
-        self.add_item(PointTargetSelect(self))
-        self.add_item(StartDateSelect(self))
-        self.add_item(EndDateSelect(self))
-        self.add_item(StrategySelect(self))
-        self.add_item(BuildTeamButton(self))
-
-        await interaction.response.edit_message(
-            content=None,
-            embed=self.summary_embed(),
-            view=self,
-        )
-
-
-
-@bot.tree.command(
-    name="streakteam",
-    description="Baut bis zu 4 Streak-Teams aus deinen spielberechtigten Karten.",
-    guild=guild_object,
-)
-@app_commands.describe(
-    wettbewerb="Welchen Pro/Hot-Streak-Wettbewerb willst du spielen?",
-    seltenheit="Limited oder Rare",
-)
-@app_commands.choices(
-    wettbewerb=competition_choices,
-    seltenheit=[
-        app_commands.Choice(name="Limited", value="limited"),
-        app_commands.Choice(name="Rare", value="rare"),
-    ],
-)
-async def streakteam(
-    interaction: discord.Interaction,
-    wettbewerb: app_commands.Choice[str],
-    seltenheit: app_commands.Choice[str],
-):
-    competition_key = wettbewerb.value
-    competition_name = PRO_COMPETITIONS.get(
-        competition_key,
-        wettbewerb.name,
-    )
-
-    rarity = seltenheit.value
-    rarity_name = seltenheit.name
-
-    view = DateRangeView(
-        owner_id=interaction.user.id,
-        competition_key=competition_key,
-        competition_name=competition_name,
-        rarity=rarity,
-        rarity_name=rarity_name,
-    )
-
-    await interaction.response.send_message(
-        embed=view.summary_embed(),
-        view=view,
-        ephemeral=True,
-    )
-
-
-async def run_streakteam_analysis(
-    interaction: discord.Interaction,
+def card_is_eligible_for_competition(
+    card: dict,
     competition_key: str,
-    competition_name: str,
-    rarity: str,
-    rarity_name: str,
-    zielpunkte: int,
-    strategy_mode: str,
-    von: str,
-    bis: str,
-):
-    try:
-        print()
-        print("=" * 72)
-        print(
-            f"/streakteam | {interaction.user.id} | "
-            f"{competition_name} | {rarity_name} | Ziel {zielpunkte} | Strategie {strategy_mode} | {von} bis {bis}"
-        )
-        print("=" * 72)
+) -> bool:
+    game = card.get("next_game") or {}
 
-        # 1) Alle Karten dieser Seltenheit, ALLE Saisons.
-        result = await get_cards_for_discord_user(
-            interaction.user.id,
-            rarity=rarity,
-        )
+    # Für die Wettbewerbsberechtigung ist die nationale Liga des Vereins
+    # entscheidend, nicht der Wettbewerb des konkreten Spiels.
+    # Beispiel: Ein 2.-Bundesliga-Spieler kann in derselben Sorare-GW
+    # im DFB-Pokal/Europa/etc. spielen; er bleibt trotzdem ein
+    # 2.-Bundesliga-/Contender-Spieler.
+    domestic_name = game.get("domestic_league_name")
+    domestic_slug = game.get("domestic_league_slug")
 
-        if result.get("error") == "DISCORD_USER_NOT_MAPPED":
-            await interaction.followup.send(
-                "❌ Deine Discord-ID ist noch keinem Sorare-Account zugeordnet."
-            )
-            return
+    match_name = game.get("competition_name")
+    match_slug = game.get("competition_slug")
 
-        cards = result.get("cards") or []
-        sorare_slug = result.get("sorare_slug")
+    name = domestic_name or match_name
+    slug = domestic_slug or match_slug
 
-        if not cards:
-            await interaction.followup.send(
-                f"❌ Keine {rarity_name}-Karten gefunden."
-            )
-            return
+    # Es muss wirklich ein Sorare-eligible Spiel in der GW geben.
+    if not game.get("fixture_slug"):
+        return False
 
-        # 2) Mehrere zukünftige Spiele laden, damit der gewünschte
-        # Zeitraum per Discord-Auswahl genutzt werden kann.
-        cards = await add_future_games_to_cards(cards)
+    if competition_key == "contender":
+        normalized_slug = str(slug or "").lower()
 
-        before_range = len(cards)
-
-        try:
-            cards, fixtures_in_range = select_date_range(
-                cards,
-                start_date=von,
-                end_date=bis,
-            )
-        except ValueError as exc:
-            await interaction.followup.send(
-                f"❌ {exc}"
-            )
-            return
-
-        print(
-            f"Zeitraum {von} bis {bis}: "
-            f"{len(cards)}/{before_range} Karten mit Spiel"
+        # IN-SEASON CONTENDER:
+        # Nur die vier echten Contender-In-Season-Ligen:
+        # 2. Bundesliga, Austrian Bundesliga, HNL und Ligue 2.
+        #
+        # WICHTIG:
+        # MLS, Champions League, Premier League usw. werden hier selbst dann
+        # ausgeschlossen, wenn die Karte Saison 2026 und inSeasonEligible ist.
+        inseason_label = _match_aliases(
+            name,
+            slug,
+            CONTENDER_INSEASON_ALIASES,
         )
 
-        fixture_gws = sorted(
-            {
-                fixture.get("game_week")
-                for fixture in fixtures_in_range
-                if fixture.get("game_week") is not None
-            }
+        is_contender_inseason_competition = (
+            normalized_slug in CONTENDER_INSEASON_SLUGS
+            or inseason_label is not None
         )
 
-        if fixture_gws:
-            print(
-                "[Zeitraum] Sorare GameWeeks: "
-                + ", ".join(f"GW {gw}" for gw in fixture_gws)
-            )
-
-        if not cards:
-            await interaction.followup.send(
-                f"❌ Zwischen **{von}** und **{bis}** hat keiner deiner "
-                "Spieler ein SO5-eligible Spiel."
-            )
-            return
-
-        # 3) Diagnose des GameWeek-Pools vor dem Liga-Filter.
-        pool_summary = summarize_card_pool(cards)
-
-        print(
-            f"[GW-Pool] Saison 2026: {pool_summary['current_season']} | "
-            f"Sorare In-Season eligible: {pool_summary['api_inseason_eligible']} | "
-            f"ältere Karten: {pool_summary['classic']}"
-        )
-        print("[GW-Pool] Nationale Ligen der Vereine:")
-        for league, count in pool_summary["domestic_leagues"].most_common():
-            print(f"  - {league}: {count}")
-
-        print("[GW-Pool] Tatsächliche Spiele in dieser GW:")
-        for competition, count in pool_summary["competitions"].most_common():
-            print(f"  - {competition}: {count}")
-
-        print("[GW-Pool] Saisons:")
-        for season, count in sorted(
-            pool_summary["seasons"].items(),
-            key=lambda item: (item[0] is None, item[0]),
+        if (
+            card.get("current_season_card")
+            and card.get("api_in_season_eligible")
+            and is_contender_inseason_competition
         ):
-            print(f"  - {season}: {count}")
-
-        if competition_key == "contender":
-            diag = contender_inseason_diagnostics(cards)
-
-            print()
-            print("=" * 72)
-            print(
-                f"[CONTENDER 2026 DIAGNOSE] "
-                f"{len(diag['rows'])} Saison-2026-Karten im Zeitraum {von} bis {bis}"
+            card["in_season"] = True
+            card["classic"] = False
+            card["contender_inseason_league"] = (
+                inseason_label
+                or name
+                or slug
             )
-            print("=" * 72)
+            return True
 
-            print(
-                f"[CONTENDER AKZEPTIERT] {len(diag['accepted'])}"
+        # CLASSIC CONTENDER:
+        # Ältere Karten dürfen ausschließlich aus dem von dir festgelegten
+        # erweiterten Classic-Ligenpool kommen.
+        #
+        # Eine aktuelle 2026-Karte aus MLS/UCL soll NICHT als Classic
+        # "umetikettiert" werden, nur weil sie In-Season für Contender
+        # nicht zulässig ist.
+        if not card.get("current_season_card"):
+            classic_label = _match_aliases(
+                name,
+                slug,
+                CONTENDER_CLASSIC_ALIASES,
             )
-            if diag["accepted"]:
-                for row in diag["accepted"]:
-                    print(
-                        f"  ✅ {row['player_name']} | "
-                        f"{row['club_name']} | "
-                        f"{row['domestic_league_name']} | "
-                        f"Sorare eligible={row['api_in_season_eligible']} | "
-                        f"Spiel: {row['match_competition']}"
-                    )
-            else:
-                print("  - keine")
 
-            print()
-            print(
-                f"[CONTENDER ABGELEHNT] {len(diag['rejected'])}"
-            )
-            if diag["rejected"]:
-                for row in diag["rejected"]:
-                    print(
-                        f"  ❌ {row['player_name']} | "
-                        f"{row['club_name']} | "
-                        f"{row['domestic_league_name']} | "
-                        f"Sorare eligible={row['api_in_season_eligible']} | "
-                        f"Grund: {row['reason']} | "
-                        f"Spiel: {row['match_competition']}"
-                    )
-            else:
-                print("  - keine")
+            if classic_label is not None:
+                card["in_season"] = False
+                card["classic"] = True
+                card["contender_classic_league"] = classic_label
+                return True
 
-            print("=" * 72)
-            print()
+        return False
 
-        # 4) Auf ausgewählten Wettbewerb filtern.
-        cards = filter_competition_cards(
-            cards,
-            competition_key,
+    # EINZELNE LIGA:
+    # Ab hier gilt ein harter, exakter Liga-Filter.
+    # Kein Teilstring-Matching mehr, damit sich Ligen nicht gegenseitig
+    # "fangen" können (z.B. Bundesliga vs. 2. Bundesliga).
+    aliases = DEDICATED_ALIASES.get(competition_key, [])
+
+    if not aliases:
+        return False
+
+    return _match_aliases_exact(
+        name,
+        slug,
+        aliases,
+    ) is not None
+
+
+
+def summarize_card_pool(cards: List[dict]) -> dict:
+    competitions = Counter()
+    domestic_leagues = Counter()
+    seasons = Counter()
+
+    for card in cards:
+        game = card.get("next_game") or {}
+
+        competition_name = (
+            game.get("competition_name")
+            or game.get("competition_slug")
+            or "Unbekannt"
+        )
+        competitions[competition_name] += 1
+
+        domestic_name = (
+            game.get("domestic_league_name")
+            or game.get("domestic_league_slug")
+            or "Unbekannt"
+        )
+        domestic_leagues[domestic_name] += 1
+
+        seasons[card.get("season_year")] += 1
+
+    return {
+        "competitions": competitions,
+        "domestic_leagues": domestic_leagues,
+        "seasons": seasons,
+        "inseason": sum(1 for card in cards if card.get("in_season")),
+        "classic": sum(1 for card in cards if card.get("classic")),
+        "api_inseason_eligible": sum(
+            1 for card in cards if card.get("api_in_season_eligible")
+        ),
+        "current_season": sum(
+            1 for card in cards if card.get("current_season_card")
+        ),
+    }
+
+
+
+def contender_inseason_diagnostics(cards: List[dict]) -> dict:
+    """
+    Detaillierte Diagnose für Contender:
+    - alle Saison-2026-Karten in der gewählten Sorare-GW
+    - nationale Liga
+    - konkreter Spielwettbewerb
+    - Sorare inSeasonEligible
+    - ob die Karte als Contender In-Season akzeptiert wird
+    """
+    rows = []
+
+    for card in cards:
+        if card.get("season_year") != CURRENT_SEASON_YEAR:
+            continue
+
+        game = card.get("next_game") or {}
+
+        domestic_name = (
+            game.get("domestic_league_name")
+            or game.get("domestic_league_slug")
+            or "Unbekannt"
+        )
+        domestic_slug = game.get("domestic_league_slug")
+
+        match_name = (
+            game.get("competition_name")
+            or game.get("competition_slug")
+            or "Unbekannt"
         )
 
-        filtered_summary = summarize_card_pool(cards)
-
-        print(
-            f"[{competition_name}] Nach Berechtigungsfilter: {len(cards)} Karten | "
-            f"In-Season: {filtered_summary['inseason']} | "
-            f"Classic: {filtered_summary['classic']}"
+        inseason_label = _match_aliases(
+            domestic_name,
+            domestic_slug,
+            CONTENDER_INSEASON_ALIASES,
         )
 
-        print(f"[{competition_name}] Zugelassene nationale Ligen:")
-        for league, count in filtered_summary["domestic_leagues"].most_common():
-            print(f"  - {league}: {count}")
+        normalized_slug = str(domestic_slug or "").lower()
 
-        print(f"[{competition_name}] Tatsächliche Spiele:")
-        for competition, count in filtered_summary["competitions"].most_common():
-            print(f"  - {competition}: {count}")
-
-        if not cards:
-            await interaction.followup.send(
-                f"❌ Keine spielberechtigten {rarity_name}-Karten für "
-                f"**{competition_name}** in dieser GameWeek gefunden."
-            )
-            return
-
-        # 5) Official Sorare Startelf-Prognosen. KEIN eigener Fallback.
-        cards = await add_start_probabilities(cards)
-
-        # Harte Startelf-Regel:
-        # Wenn Sorare eine offizielle Startelfwahrscheinlichkeit liefert
-        # und diese unter 60% liegt, wird der Spieler NICHT berücksichtigt.
-        # Fehlt die Sorare-Prognose komplett, erfinden wir weiterhin keinen
-        # Wert und schließen den Spieler deshalb nicht automatisch aus.
-        before_starter_filter = len(cards)
-        cards = [
-            card
-            for card in cards
-            if (
-                card.get("starter_probability") is None
-                or float(card.get("starter_probability")) >= 60.0
-            )
-        ]
-
-        removed_starter = before_starter_filter - len(cards)
-        print(
-            f"[Startelf-Filter] {removed_starter} Karten entfernt "
-            f"(Sorare-Startelf < 60%) | {len(cards)} übrig"
+        is_contender_league = (
+            normalized_slug in CONTENDER_INSEASON_SLUGS
+            or inseason_label is not None
         )
 
-        if not cards:
-            await interaction.followup.send(
-                "❌ Nach dem Startelf-Filter ist keine spielberechtigte "
-                "Karte mehr übrig. Spieler mit einer offiziellen "
-                "Sorare-Startelfwahrscheinlichkeit unter 60% werden "
-                "nicht berücksichtigt."
-            )
-            return
+        sorare_eligible = bool(card.get("api_in_season_eligible"))
 
-        # 6) Historische Standards für MID/ST:
-        # Nur Elfmeter und Ecken aus Sorare/Opta.
-        # Nur Spieler mit tatsächlich ausgeführten Standards bekommen einen Wert.
-        cards = await add_set_piece_profiles(cards)
-
-        # 7) Clean Sheet für TW/VER.
-        cards = await add_clean_sheet_probabilities(cards)
-
-        # 8) Rating.
-        cards = add_ratings(cards)
-
-        # 9) Ungefähre Sorare-Punkte inkl. echter Kartenboni.
-        cards = add_projected_points(cards)
-
-        streak_number = get_streak_number(
-            competition_key,
-            zielpunkte,
+        accepted = (
+            sorare_eligible
+            and is_contender_league
         )
 
-        # Für Streak 1-3 sollen die Spieler möglichst gleichzeitig
-        # oder nah beieinander spielen. Ab Streak 4 ist die Anstoßzeit
-        # für die Team-Auswahl komplett egal.
-        kickoff_cluster = streak_number <= 3
+        rows.append({
+            "player_name": card.get("player_name") or "Unbekannt",
+            "player_slug": card.get("player_slug"),
+            "club_name": card.get("club_name") or "Unbekannt",
+            "domestic_league_name": domestic_name,
+            "domestic_league_slug": domestic_slug,
+            "match_competition": match_name,
+            "api_in_season_eligible": sorare_eligible,
+            "accepted": accepted,
+            "reason": (
+                "OK"
+                if accepted
+                else (
+                    "Sorare inSeasonEligible = false"
+                    if not sorare_eligible
+                    else "Nationale Liga ist nicht Contender In-Season"
+                )
+            ),
+        })
 
-        teams = build_four_streak_lineups(
-            cards,
-            target_points=zielpunkte,
+    rows.sort(
+        key=lambda row: (
+            0 if row["accepted"] else 1,
+            normalize_text(row["domestic_league_name"]),
+            normalize_text(row["club_name"]),
+            normalize_text(row["player_name"]),
+        )
+    )
+
+    return {
+        "rows": rows,
+        "accepted": [row for row in rows if row["accepted"]],
+        "rejected": [row for row in rows if not row["accepted"]],
+    }
+
+
+def filter_competition_cards(
+    cards: List[dict],
+    competition_key: str,
+) -> List[dict]:
+    filtered = [
+        card
+        for card in cards
+        if card_is_eligible_for_competition(card, competition_key)
+    ]
+
+    print(
+        f"[Liga-Filter] Auswahl={competition_key} | "
+        f"{len(filtered)}/{len(cards)} Karten zugelassen"
+    )
+
+    # Zusätzliche Diagnose: zeigt exakt, welche Domestic-League-Slugs
+    # nach dem Filter tatsächlich übrig sind.
+    remaining_leagues = Counter(
+        (
+            (card.get("next_game") or {}).get("domestic_league_slug")
+            or (card.get("next_game") or {}).get("domestic_league_name")
+            or "Unbekannt"
+        )
+        for card in filtered
+    )
+
+    for league, count in remaining_leagues.most_common():
+        print(f"[Liga-Filter]   {league}: {count}")
+
+    return filtered
+
+
+async def get_player_start_probability(player_slug: str) -> Optional[dict]:
+    data = await sorare_request(
+        STARTER_ODDS_QUERY,
+        {"playerSlug": player_slug},
+    )
+
+    players = data.get("players") or []
+    if not players:
+        return None
+
+    player = players[0] or {}
+    odds = player.get("nextClassicFixturePlayingStatusOdds")
+    if not odds:
+        return None
+
+    starter = odds.get("starterOddsBasisPoints")
+    if starter is None:
+        return None
+
+    return {
+        "starter_probability": round(float(starter) / 100.0, 1),
+        "starter_reliability": odds.get("reliability"),
+        "starter_source": "SORARE",
+    }
+
+
+async def add_start_probabilities(
+    cards: List[dict],
+    max_concurrent: int = 1,
+) -> List[dict]:
+    unique_players = {
+        card.get("player_slug")
+        for card in cards
+        if card.get("player_slug")
+    }
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    cache: Dict[str, Optional[dict]] = {}
+
+    async def load_one(slug: str):
+        async with semaphore:
+            try:
+                cache[slug] = await get_player_start_probability(slug)
+            except Exception as exc:
+                print(f"[Startelf] {slug}: {exc}")
+                cache[slug] = None
+            await asyncio.sleep(0.04)
+
+    await asyncio.gather(*(load_one(slug) for slug in unique_players))
+
+    result = []
+    for card in cards:
+        item = dict(card)
+        odds = cache.get(card.get("player_slug"))
+        item["starter_probability"] = (
+            odds.get("starter_probability") if odds else None
+        )
+        item["starter_reliability"] = (
+            odds.get("starter_reliability") if odds else None
+        )
+        item["starter_source"] = "SORARE" if odds else None
+        result.append(item)
+
+    return result
+
+
+async def get_competition_recent_games(
+    competition_slug: str,
+    max_pages: int = 2,
+) -> List[dict]:
+    after = None
+    games = []
+
+    for _ in range(max_pages):
+        data = await sorare_request(
+            COMPETITION_RECENT_GAMES_QUERY,
+            {
+                "competitionSlug": competition_slug,
+                "after": after,
+            },
+        )
+
+        competition = (
+            (data.get("football") or {}).get("competition")
+        )
+        if not competition:
+            break
+
+        connection = competition.get("pastGames") or {}
+        games.extend(connection.get("nodes") or [])
+
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+
+        after = page_info.get("endCursor")
+        if not after:
+            break
+
+    games.sort(
+        key=lambda game: game.get("date") or "",
+        reverse=True,
+    )
+    return games
+
+
+def _team_goals_for_against(game: dict, team_slug: str):
+    home = game.get("homeTeam") or {}
+    away = game.get("awayTeam") or {}
+
+    if home.get("slug") == team_slug:
+        return game.get("homeScore"), game.get("awayScore")
+    if away.get("slug") == team_slug:
+        return game.get("awayScore"), game.get("homeScore")
+    return None, None
+
+
+def build_team_form(
+    games: List[dict],
+    team_slug: str,
+    last_games: int = 8,
+) -> Optional[dict]:
+    rows = []
+
+    for game in games:
+        gf, ga = _team_goals_for_against(game, team_slug)
+        if gf is None or ga is None:
+            continue
+
+        rows.append((int(gf), int(ga)))
+        if len(rows) >= last_games:
+            break
+
+    if not rows:
+        return None
+
+    return {
+        "avg_for": sum(x[0] for x in rows) / len(rows),
+        "avg_against": sum(x[1] for x in rows) / len(rows),
+        "clean_sheet_rate": (
+            sum(1 for x in rows if x[1] == 0) / len(rows)
+        ),
+    }
+
+
+def calculate_clean_sheet_probability(
+    team_form: Optional[dict],
+    opponent_form: Optional[dict],
+    home_away: Optional[str],
+) -> Optional[int]:
+    if not team_form or not opponent_form:
+        return None
+
+    cs_rate = float(team_form["clean_sheet_rate"])
+    ga = float(team_form["avg_against"])
+    opponent_gf = float(opponent_form["avg_for"])
+
+    defense = max(0.0, min(1.0, 1.0 - ga / 2.5))
+    weak_attack = max(
+        0.0,
+        min(1.0, 1.0 - opponent_gf / 2.5),
+    )
+
+    p = cs_rate * 0.50 + defense * 0.25 + weak_attack * 0.25
+
+    if home_away == "H":
+        p += 0.04
+    elif home_away == "A":
+        p -= 0.04
+
+    return round(max(0.10, min(0.80, p)) * 100)
+
+
+def calculate_attacking_matchup_score(
+    team_form: Optional[dict],
+    opponent_form: Optional[dict],
+    home_away: Optional[str],
+) -> Optional[int]:
+    """
+    Matchup-Wert für MID/ST aus echten letzten Ligaspielen.
+
+    Berücksichtigt:
+    - wie viele Tore der eigene Verein zuletzt erzielt
+    - wie viele Tore der Gegner zuletzt kassiert
+    - wie häufig der Gegner zuletzt ohne Gegentor blieb
+    - Heim/Auswärts
+
+    50 = ungefähr neutral, höher = attraktiveres offensives Matchup.
+    """
+    if not team_form or not opponent_form:
+        return None
+
+    team_gf = float(team_form["avg_for"])
+    opponent_ga = float(opponent_form["avg_against"])
+    opponent_cs = float(opponent_form["clean_sheet_rate"])
+
+    attack_form = max(
+        0.0,
+        min(1.0, team_gf / 2.5),
+    )
+    weak_defense = max(
+        0.0,
+        min(1.0, opponent_ga / 2.5),
+    )
+    low_cs_rate = max(
+        0.0,
+        min(1.0, 1.0 - opponent_cs),
+    )
+
+    score = (
+        attack_form * 0.35
+        + weak_defense * 0.45
+        + low_cs_rate * 0.20
+    )
+
+    if home_away == "H":
+        score += 0.05
+    elif home_away == "A":
+        score -= 0.05
+
+    return round(max(0.10, min(0.90, score)) * 100)
+
+
+async def add_clean_sheet_probabilities(
+    cards: List[dict],
+    max_concurrent: int = 1,
+) -> List[dict]:
+    competition_slugs = {
+        (card.get("next_game") or {}).get("competition_slug")
+        for card in cards
+        if (card.get("next_game") or {}).get("competition_slug")
+    }
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    games_cache: Dict[str, List[dict]] = {}
+
+    async def load_one(slug: str):
+        async with semaphore:
+            try:
+                games_cache[slug] = await get_competition_recent_games(slug)
+                print(
+                    f"[Clean Sheet] {slug}: "
+                    f"{len(games_cache[slug])} Spiele"
+                )
+            except Exception as exc:
+                print(f"[Clean Sheet] {slug}: {exc}")
+                games_cache[slug] = []
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(*(load_one(slug) for slug in competition_slugs))
+
+    form_cache: Dict[Tuple[str, str], Optional[dict]] = {}
+
+    def form(comp_slug: str, team_slug: str):
+        key = (comp_slug, team_slug)
+        if key not in form_cache:
+            form_cache[key] = build_team_form(
+                games_cache.get(comp_slug, []),
+                team_slug,
+            )
+        return form_cache[key]
+
+    result = []
+
+    for card in cards:
+        item = dict(card)
+        game = card.get("next_game") or {}
+        comp = game.get("competition_slug")
+        team = game.get("team_slug")
+        opponent = game.get("opponent_slug")
+
+        probability = None
+        attacking_matchup = None
+
+        if comp and team and opponent:
+            team_form = form(comp, team)
+            opponent_form = form(comp, opponent)
+
+            probability = calculate_clean_sheet_probability(
+                team_form,
+                opponent_form,
+                game.get("home_away"),
+            )
+
+            if card.get("position") in ("MID", "ST"):
+                attacking_matchup = calculate_attacking_matchup_score(
+                    team_form,
+                    opponent_form,
+                    game.get("home_away"),
+                )
+
+        item["clean_sheet_probability"] = probability
+        item["attacking_matchup_score"] = attacking_matchup
+        result.append(item)
+
+    return result
+
+
+def _weighted_rating(components: List[Tuple[Optional[float], float]]) -> float:
+    used = [
+        (value, weight)
+        for value, weight in components
+        if value is not None
+    ]
+
+    if not used:
+        return 0.0
+
+    total_weight = sum(weight for _, weight in used)
+    return sum(value * weight for value, weight in used) / total_weight
+
+
+
+async def get_player_set_piece_profile(
+    player_slug: str,
+) -> Optional[dict]:
+    """
+    Ermittelt ausschließlich Elfmeterschüsse und Ecken aus echten
+    historischen Sorare/Opta-Spielstatistiken.
+
+    Spieler ohne ausgeführten Elfmeter UND ohne ausgeführte Ecke
+    bekommen kein Standard-Profil.
+    """
+    data = await sorare_request(
+        PLAYER_SET_PIECE_QUERY,
+        {"playerSlug": player_slug},
+    )
+
+    player = data.get("anyPlayer") or {}
+    connection = player.get("allPlayerGameScores") or {}
+    nodes = connection.get("nodes") or []
+
+    appearances = 0
+    penalties = 0
+    corners = 0
+
+    for node in nodes:
+        stats = (node or {}).get("anyPlayerGameStats") or {}
+
+        mins = stats.get("minsPlayed")
+        if mins is not None and float(mins or 0) > 0:
+            appearances += 1
+
+        penalties += int(stats.get("penaltyTaken") or 0)
+        corners += int(stats.get("cornerTaken") or 0)
+
+    # Ganz wichtig:
+    # Nur Spieler, die tatsächlich mindestens einen Elfmeter ODER
+    # mindestens eine Ecke ausgeführt haben, bekommen ein Profil.
+    if penalties == 0 and corners < 10:
+        return None
+
+    # Penalties stärker gewichten als Ecken.
+    # Nur diese beiden Kategorien beeinflussen das Rating.
+    score = min(
+        100.0,
+        penalties * 30.0
+        + (corners * 4.0 if corners >= 10 else 0.0),
+    )
+
+    return {
+        "appearances": appearances,
+        "penalties": penalties,
+        "corners": corners,
+        "set_piece_score": round(score, 1),
+        "source": "SORARE/OPTA HISTORIE",
+    }
+
+
+async def add_set_piece_profiles(
+    cards: List[dict],
+    max_concurrent: int = 1,
+) -> List[dict]:
+    unique_players = {
+        card.get("player_slug")
+        for card in cards
+        if card.get("player_slug")
+        and card.get("position") in ("MID", "ST")
+    }
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    cache: Dict[str, Optional[dict]] = {}
+
+    async def load_one(slug: str):
+        async with semaphore:
+            try:
+                cache[slug] = await get_player_set_piece_profile(slug)
+            except Exception as exc:
+                # Standards sind ein Zusatzsignal. Wenn Sorare für einen
+                # Spieler keine passenden Daten liefert, läuft der Builder
+                # ohne erfundene Ersatzwerte weiter.
+                print(f"[Standards] {slug}: {exc}")
+                cache[slug] = None
+            await asyncio.sleep(0.04)
+
+    await asyncio.gather(*(load_one(slug) for slug in unique_players))
+
+    result = []
+    for card in cards:
+        item = dict(card)
+        profile = cache.get(card.get("player_slug"))
+
+        item["set_piece_profile"] = profile
+        item["set_piece_score"] = (
+            profile.get("set_piece_score")
+            if profile
+            else None
+        )
+        result.append(item)
+
+    return result
+
+def calculate_card_rating(card: dict) -> float:
+    l40_score = max(
+        0.0,
+        min(100.0, (card.get("l40", 0.0) / 80.0) * 100),
+    )
+    starter = card.get("starter_probability")
+    cs = card.get("clean_sheet_probability")
+    set_piece_score = card.get("set_piece_score")
+    attacking_matchup = card.get("attacking_matchup_score")
+
+    game = card.get("next_game") or {}
+    home_score = 60.0 if game.get("home_away") == "H" else 45.0
+
+    position = card.get("position")
+
+    if position == "TW":
+        rating = _weighted_rating([
+            (cs, 0.35),
+            (starter, 0.30),
+            (l40_score, 0.30),
+            (home_score, 0.05),
+        ])
+    elif position == "VER":
+        rating = _weighted_rating([
+            (cs, 0.30),
+            (starter, 0.25),
+            (l40_score, 0.35),
+            (home_score, 0.10),
+        ])
+    else:
+        # Elfmeter und Ecken sind jetzt ein Zusatzsignal für MID/ST.
+        # Fehlen Standarddaten oder Sorare-Startelf-%, renormalisiert
+        # _weighted_rating automatisch die vorhandenen Komponenten.
+        rating = _weighted_rating([
+            (starter, 0.20),
+            (l40_score, 0.45),
+            (set_piece_score, 0.15),
+            (attacking_matchup, 0.15),
+            (home_score, 0.05),
+        ])
+
+    return round(rating, 1)
+
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def _weighted_point_projection(
+    components: List[Tuple[Optional[float], float]],
+) -> float:
+    """
+    Gewichteter Mittelwert. Fehlt ein Signal, werden die vorhandenen
+    Gewichte automatisch neu auf 100% verteilt.
+    """
+    usable = [
+        (float(value), float(weight))
+        for value, weight in components
+        if value is not None and weight > 0
+    ]
+
+    if not usable:
+        return 0.0
+
+    total_weight = sum(weight for _, weight in usable)
+    return sum(
+        value * weight
+        for value, weight in usable
+    ) / total_weight
+
+
+def estimate_player_base_points(card: dict) -> float:
+    """
+    Verbesserte Punkte-Prognose V2.
+
+    Kern:
+    - 40% aktuelle Form (L5, geglättet mit L10)
+    - 25% L40
+    - 15% offizielle Sorare-Startelfwahrscheinlichkeit
+    - 10% Matchup
+    - 5% Heim/Auswärts
+    - 5% Standards/Rolle
+
+    TW/VER:
+    Das Matchup wird stattdessen stärker über die Clean-Sheet-Chance
+    abgebildet, weil diese für Defensivspieler wesentlich wichtiger ist.
+
+    Fehlende Signale werden NICHT erfunden. Die vorhandenen Gewichte
+    werden automatisch neu verteilt.
+    """
+    l40 = float(card.get("l40") or 0.0)
+
+    l5 = card.get("l5")
+    l10 = card.get("l10")
+
+    # Aktuelle Form: L5 ist am wichtigsten, L10 stabilisiert Ausreißer.
+    if l5 is not None and l10 is not None:
+        recent_form = (
+            float(l5) * 0.70
+            + float(l10) * 0.30
+        )
+    elif l5 is not None:
+        recent_form = float(l5)
+    elif l10 is not None:
+        recent_form = float(l10)
+    else:
+        recent_form = None
+
+    starter = card.get("starter_probability")
+    if starter is not None:
+        # 60% (unsere Mindestgrenze) entspricht ca. 54 Punkten,
+        # 100% entspricht 70. So verbessert hohe Startelfsicherheit
+        # die Prognose, ohne den eigentlichen Sorare-Score zu dominieren.
+        starter_component = 30.0 + float(starter) * 0.40
+        starter_component = _clamp_score(starter_component)
+    else:
+        starter_component = None
+
+    game = card.get("next_game") or {}
+    home_away = game.get("home_away")
+
+    if home_away == "H":
+        venue_component = 55.0
+    elif home_away == "A":
+        venue_component = 45.0
+    else:
+        venue_component = None
+
+    position = card.get("position")
+
+    if position in ("TW", "VER"):
+        cs = card.get("clean_sheet_probability")
+
+        if cs is not None:
+            # 35% Clean-Sheet-Chance ~= neutrales Matchup.
+            # Höhere CS-Chance hebt die erwarteten Defensivpunkte klar an.
+            defensive_matchup = _clamp_score(
+                50.0 + (float(cs) - 35.0) * 0.80
+            )
+        else:
+            defensive_matchup = None
+
+        # Bei TW/VER ist das Defensiv-Matchup wichtiger als Standards.
+        projected = _weighted_point_projection([
+            (recent_form, 40.0),
+            (l40, 25.0),
+            (starter_component, 15.0),
+            (defensive_matchup, 15.0),
+            (venue_component, 5.0),
+        ])
+
+    else:
+        matchup = card.get("attacking_matchup_score")
+        matchup_component = (
+            _clamp_score(float(matchup))
+            if matchup is not None
+            else None
+        )
+
+        set_piece_score = card.get("set_piece_score")
+        if set_piece_score is not None:
+            # Kein Standard = neutrales Signal. Gute Standards geben Upside,
+            # ohne aus einem 50er-Spieler künstlich einen 80er zu machen.
+            set_piece_component = _clamp_score(
+                50.0 + float(set_piece_score) * 0.20
+            )
+        else:
+            set_piece_component = None
+
+        projected = _weighted_point_projection([
+            (recent_form, 40.0),
+            (l40, 25.0),
+            (starter_component, 15.0),
+            (matchup_component, 10.0),
+            (venue_component, 5.0),
+            (set_piece_component, 5.0),
+        ])
+
+    return round(_clamp_score(projected), 1)
+
+
+def add_projected_points(cards: List[dict]) -> List[dict]:
+    """
+    Ergänzt:
+    - projected_base_points: geschätzter Spieler-Score vor Kartenboni
+    - projected_card_points: geschätzter Karten-Score inkl.
+      In-Season + XP + Sammlungsbonus
+    """
+    result = []
+
+    for card in cards:
+        item = dict(card)
+
+        base_points = estimate_player_base_points(item)
+
+        xp_bonus = float(item.get("xp_bonus_pct") or 0.0)
+        collection_bonus = float(
+            item.get("collection_bonus_pct") or 0.0
+        )
+
+        # Für In-Season gilt 5%. Classic bekommt keinen Season-Bonus.
+        inseason_bonus = 5.0 if item.get("in_season") else 0.0
+
+        total_card_bonus = (
+            inseason_bonus
+            + xp_bonus
+            + collection_bonus
+        )
+
+        projected_card_points = (
+            base_points * (1.0 + total_card_bonus / 100.0)
+        )
+
+        item["inseason_bonus_pct"] = round(inseason_bonus, 2)
+        item["total_card_bonus_pct"] = round(total_card_bonus, 2)
+        item["projected_base_points"] = round(base_points, 1)
+        item["projected_card_points"] = round(
+            projected_card_points,
+            1,
+        )
+
+        result.append(item)
+
+    return result
+
+def add_ratings(cards: List[dict]) -> List[dict]:
+    result = []
+    for card in cards:
+        item = dict(card)
+        item["rating"] = calculate_card_rating(item)
+        result.append(item)
+    return result
+
+
+def _best_card_for_player(cards: List[dict]) -> List[dict]:
+    grouped = defaultdict(list)
+    for card in cards:
+        grouped[card.get("player_slug")].append(card)
+
+    result = []
+
+    for player_cards in grouped.values():
+        # Bei gleicher Leistung In-Season bevorzugen, damit der Classic-Slot
+        # für einen echten Mehrwert frei bleibt.
+        player_cards.sort(
+            key=lambda c: (
+                c.get("rating", 0),
+                1 if c.get("in_season") else 0,
+                c.get("season_year") or 0,
+            ),
+            reverse=True,
+        )
+        result.extend(player_cards)
+
+    return result
+
+
+def _lineup_valid(lineup: List[dict]) -> bool:
+    if len(lineup) != 5:
+        return False
+
+    players = [card.get("player_slug") for card in lineup]
+    if len(set(players)) != 5:
+        return False
+
+    if sum(1 for card in lineup if card.get("classic")) > 1:
+        return False
+
+    if sum(1 for card in lineup if card.get("in_season")) < 4:
+        return False
+
+    positions = Counter(card.get("position") for card in lineup)
+
+    if positions["TW"] != 1:
+        return False
+    if positions["VER"] < 1:
+        return False
+    if positions["MID"] < 1:
+        return False
+    if positions["ST"] < 1:
+        return False
+
+    return True
+
+
+def _stack_profile(
+    target_points: int,
+    strategy_mode: str = "balanced",
+) -> dict:
+    if target_points <= 340:
+        profile = {
+            "pick_bonus": 24.0,
+            "stack_bonus": {1: 0, 2: 10, 3: 28, 4: 58, 5: 95},
+            "gk_def_bonus": 24.0,
+            "quality_floor": 22.0,
+        }
+    elif target_points <= 380:
+        profile = {
+            "pick_bonus": 15.0,
+            "stack_bonus": {1: 0, 2: 8, 3: 20, 4: 38, 5: 58},
+            "gk_def_bonus": 18.0,
+            "quality_floor": 16.0,
+        }
+    elif target_points <= 420:
+        profile = {
+            "pick_bonus": 7.0,
+            "stack_bonus": {1: 0, 2: 5, 3: 12, 4: 22, 5: 30},
+            "gk_def_bonus": 11.0,
+            "quality_floor": 10.0,
+        }
+    else:
+        profile = {
+            "pick_bonus": 1.5,
+            "stack_bonus": {1: 0, 2: 2, 3: 4, 4: 7, 5: 10},
+            "gk_def_bonus": 5.0,
+            "quality_floor": 4.0,
+        }
+
+    # Safe: mehr Stack + Defensive Korrelation, weniger Bereitschaft
+    # schwächere Einzelspieler außerhalb einer stabilen Struktur zu nehmen.
+    if strategy_mode == "safe":
+        profile["pick_bonus"] *= 1.20
+        profile["gk_def_bonus"] *= 1.25
+        profile["stack_bonus"] = {
+            size: bonus * 1.20
+            for size, bonus in profile["stack_bonus"].items()
+        }
+
+    # Risky: weniger Stack-Zwang, mehr Einzelqualität/Upside.
+    elif strategy_mode == "risky":
+        profile["pick_bonus"] *= 0.55
+        profile["gk_def_bonus"] *= 0.65
+        profile["stack_bonus"] = {
+            size: bonus * 0.55
+            for size, bonus in profile["stack_bonus"].items()
+        }
+        profile["quality_floor"] *= 0.60
+
+    return profile
+
+
+def _strategy_card_bonus(
+    card: dict,
+    strategy_mode: str,
+) -> float:
+    """
+    Zusatzsignal für die Teamwahl.
+    Das normale Karten-Rating bleibt unverändert und transparent.
+    """
+    if strategy_mode == "balanced":
+        return 0.0
+
+    starter = card.get("starter_probability")
+    cs = card.get("clean_sheet_probability")
+    l40 = float(card.get("l40") or 0.0)
+    position = card.get("position")
+    profile = card.get("set_piece_profile") or {}
+
+    if strategy_mode == "safe":
+        bonus = 0.0
+
+        # Offizielle Sorare-Startelfprognose ist im Safe-Modus besonders wichtig.
+        if starter is not None:
+            bonus += (float(starter) - 50.0) * 0.12
+
+        # TW/VER mit hoher Clean-Sheet-Chance werden zusätzlich belohnt.
+        if position in ("TW", "VER") and cs is not None:
+            bonus += (float(cs) - 35.0) * 0.10
+
+        return bonus
+
+    if strategy_mode == "risky":
+        # Risky sucht mehr Upside: starkes L40 und Standards bei MID/ST.
+        bonus = max(0.0, l40 - 55.0) * 0.18
+
+        if position in ("MID", "ST"):
+            penalties = int(profile.get("penalties") or 0)
+            corners = int(profile.get("corners") or 0)
+
+            if penalties > 0:
+                bonus += min(8.0, penalties * 2.5)
+
+            if corners >= 10:
+                bonus += min(6.0, (corners - 9) * 0.20)
+
+        return bonus
+
+    return 0.0
+
+
+def _pick_best(
+    pool: List[dict],
+    position: str,
+    used_players: set,
+    classic_used: int,
+    preferred_club: Optional[str] = None,
+    stack_weight: float = 0.0,
+    lineup: Optional[List[dict]] = None,
+    target_points: int = 380,
+    strategy_mode: str = "balanced",
+    kickoff_cluster: bool = False,
+) -> Optional[dict]:
+    candidates = []
+    profile = _stack_profile(target_points, strategy_mode)
+    lineup = lineup or []
+
+    position_pool = []
+
+    for card in pool:
+        if card.get("position") != position:
+            continue
+        if card.get("player_slug") in used_players:
+            continue
+        if card.get("classic") and classic_used >= 1:
+            continue
+
+        # Für Streak 1-3 ist das jetzt eine HARTE Regel:
+        # Zwischen dem frühesten und spätesten Anstoß im Team dürfen
+        # maximal 6 Stunden (= 360 Minuten) liegen.
+        if kickoff_cluster and lineup:
+            spread = _kickoff_spread_minutes(lineup + [card])
+            if spread is not None and spread > 360:
+                continue
+
+        position_pool.append(card)
+
+    if not position_pool:
+        return None
+
+    best_raw = max(card.get("rating", 0) for card in position_pool)
+
+    for card in position_pool:
+        rating = card.get("rating", 0)
+
+        # Ein Stack-Spieler darf nicht beliebig schwach sein.
+        # Bei niedrigen Zielen akzeptieren wir mehr Qualitätsverlust,
+        # bei hohen Zielen fast keinen.
+        quality_gap = best_raw - rating
+        if (
+            preferred_club
+            and card.get("club_slug") == preferred_club
+            and quality_gap > profile["quality_floor"]
+        ):
+            stack_bonus = 0.0
+        else:
+            stack_bonus = (
+                stack_weight
+                if preferred_club
+                and card.get("club_slug") == preferred_club
+                else 0.0
+            )
+
+        # GK + VER desselben Clubs besonders wertvoll:
+        # ein Clean Sheet hilft beiden Karten gleichzeitig.
+        defensive_pair_bonus = 0.0
+        if position in ("TW", "VER"):
+            for selected in lineup:
+                if (
+                    selected.get("club_slug") == card.get("club_slug")
+                    and {selected.get("position"), position} == {"TW", "VER"}
+                ):
+                    defensive_pair_bonus = profile["gk_def_bonus"]
+                    break
+
+        inseason_bonus = 1.5 if card.get("in_season") else 0.0
+
+        candidates.append(
+            (
+                rating
+                + stack_bonus
+                + defensive_pair_bonus
+                + inseason_bonus
+                + _strategy_card_bonus(card, strategy_mode),
+                card,
+            )
+        )
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _build_lineup_from_anchor(
+    pool: List[dict],
+    anchor_club: Optional[str],
+    target_points: int,
+    strategy_mode: str = "balanced",
+    kickoff_cluster: bool = False,
+) -> Optional[List[dict]]:
+    profile = _stack_profile(target_points, strategy_mode)
+    stack_weight = profile["pick_bonus"]
+
+    used_players = set()
+    lineup = []
+    classic_used = 0
+
+    for position in ["TW", "VER", "MID", "ST"]:
+        card = _pick_best(
+            pool,
+            position,
+            used_players,
+            classic_used,
+            preferred_club=anchor_club,
+            stack_weight=stack_weight,
+            lineup=lineup,
+            target_points=target_points,
             strategy_mode=strategy_mode,
             kickoff_cluster=kickoff_cluster,
         )
 
-        inseason_count = sum(
-            1 for card in cards if card.get("in_season")
+        if card is None:
+            return None
+
+        lineup.append(card)
+        used_players.add(card.get("player_slug"))
+        classic_used += int(bool(card.get("classic")))
+
+    extras = []
+    for position in ["VER", "MID", "ST"]:
+        card = _pick_best(
+            pool,
+            position,
+            used_players,
+            classic_used,
+            preferred_club=anchor_club,
+            stack_weight=stack_weight,
+            lineup=lineup,
+            target_points=target_points,
+            strategy_mode=strategy_mode,
+            kickoff_cluster=kickoff_cluster,
         )
-        classic_count = sum(
-            1 for card in cards if card.get("classic")
+        if card:
+            extras.append(card)
+
+    if not extras:
+        return None
+
+    # Beim Extra nicht nur Einzelrating betrachten, sondern den Wert des
+    # vollständigen Lineups. So kann ein sinnvoller 4er/5er Stack gewinnen.
+    extra_candidates = []
+    for extra in extras:
+        candidate_lineup = lineup + [extra]
+        if _lineup_valid(candidate_lineup):
+            extra_candidates.append(
+                (
+                    _lineup_value(candidate_lineup, target_points, strategy_mode, kickoff_cluster),
+                    extra,
+                )
+            )
+
+    if not extra_candidates:
+        return None
+
+    extra_candidates.sort(key=lambda x: x[0], reverse=True)
+    lineup.append(extra_candidates[0][1])
+
+    if not _lineup_valid(lineup):
+        return None
+
+    # Zusätzliche Sicherheitsprüfung: Bei Streak 1-3 darf kein
+    # vollständiges Team mehr als 6 Stunden Anstoß-Abstand haben.
+    if kickoff_cluster:
+        spread = _kickoff_spread_minutes(lineup)
+        if spread is not None and spread > 360:
+            return None
+
+    return lineup
+
+
+
+def _card_kickoff_datetime(card: dict) -> Optional[datetime]:
+    game = card.get("next_game") or {}
+    return _parse_sorare_datetime(game.get("date"))
+
+
+def _kickoff_spread_minutes(lineup: List[dict]) -> Optional[int]:
+    times = [
+        _card_kickoff_datetime(card)
+        for card in lineup
+    ]
+    times = [dt for dt in times if dt is not None]
+
+    if len(times) < 2:
+        return None
+
+    spread = max(times) - min(times)
+    return round(spread.total_seconds() / 60)
+
+
+def _kickoff_cluster_bonus(
+    lineup: List[dict],
+    kickoff_cluster: bool,
+) -> float:
+    """
+    Für Streak 1-3 sollen die fünf Spieler möglichst gleichzeitig
+    oder zeitlich nah beieinander spielen. Zusätzlich gilt eine harte
+    Obergrenze von 6 Stunden zwischen erstem und letztem Anstoß.
+
+    Streak 4+ ignoriert die Anstoßzeiten vollständig.
+    """
+    if not kickoff_cluster:
+        return 0.0
+
+    spread = _kickoff_spread_minutes(lineup)
+    if spread is None:
+        return 0.0
+
+    # Sehr starke Bevorzugung gleicher/naher Anstoßzeiten.
+    if spread <= 15:
+        return 70.0
+    if spread <= 45:
+        return 55.0
+    if spread <= 90:
+        return 40.0
+    if spread <= 120:
+        return 28.0
+    if spread <= 180:
+        return 12.0
+    if spread <= 240:
+        return -10.0
+    if spread <= 300:
+        return -25.0
+    if spread <= 360:
+        return -40.0
+
+    # Eigentlich bereits durch den harten Filter ausgeschlossen.
+    # Dieser Rückgabewert ist nur ein zusätzlicher Schutz.
+    return -1000000.0
+
+def _lineup_value(
+    lineup: List[dict],
+    target_points: int,
+    strategy_mode: str = "balanced",
+    kickoff_cluster: bool = False,
+) -> float:
+    profile = _stack_profile(target_points, strategy_mode)
+    base = sum(
+        card.get("rating", 0)
+        + _strategy_card_bonus(card, strategy_mode)
+        for card in lineup
+    )
+
+    clubs = Counter(card.get("club_slug") for card in lineup)
+    max_stack = max(clubs.values()) if clubs else 1
+    stack_bonus = profile["stack_bonus"].get(max_stack, 0)
+
+    # Expliziter GK+DEF-Bonus pro Club.
+    defensive_pair_bonus = 0.0
+    for club_slug in clubs:
+        positions = {
+            card.get("position")
+            for card in lineup
+            if card.get("club_slug") == club_slug
+        }
+        if "TW" in positions and "VER" in positions:
+            defensive_pair_bonus += profile["gk_def_bonus"]
+
+    kickoff_bonus = _kickoff_cluster_bonus(
+        lineup,
+        kickoff_cluster,
+    )
+
+    return (
+        base
+        + stack_bonus
+        + defensive_pair_bonus
+        + kickoff_bonus
+    )
+
+
+def _candidate_signature(lineup: List[dict]) -> tuple:
+    return tuple(
+        sorted(
+            str(card.get("card_slug") or card.get("player_slug"))
+            for card in lineup
+        )
+    )
+
+
+def _generate_lineup_candidates(
+    pool: List[dict],
+    target_points: int,
+    strategy_mode: str = "balanced",
+    kickoff_cluster: bool = False,
+) -> List[Tuple[float, List[dict]]]:
+    clubs = Counter(
+        card.get("club_slug")
+        for card in pool
+        if card.get("club_slug")
+    )
+
+    anchors = [club for club, _ in clubs.most_common(30)]
+
+    # Hohe Ziele testen die reine Qualitätsvariante zuerst.
+    if target_points >= 420:
+        anchors = [None] + anchors
+    else:
+        anchors = anchors + [None]
+
+    candidates = []
+    seen = set()
+
+    for anchor in anchors:
+        lineup = _build_lineup_from_anchor(
+            pool,
+            anchor,
+            target_points,
+            strategy_mode,
+            kickoff_cluster,
+        )
+        if not lineup:
+            continue
+
+        if kickoff_cluster:
+            spread = _kickoff_spread_minutes(lineup)
+            if spread is not None and spread > 360:
+                continue
+
+        signature = _candidate_signature(lineup)
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        candidates.append(
+            (_lineup_value(lineup, target_points, strategy_mode, kickoff_cluster), lineup)
         )
 
-        summary = discord.Embed(
-            title=f"🔥 {competition_name} – {rarity_name}",
-            description=(
-                f"**Sorare:** `{sorare_slug}`\n"
-                f"📅 **Zeitraum:** **{von} bis {bis}**\n"
-                f"🎮 **Sorare GWs im Zeitraum:** "
-                f"{', '.join(f'GW {gw}' for gw in fixture_gws) if fixture_gws else '—'}\n"
-                f"🎯 **Aktuelles Ziel:** {zielpunkte} Punkte "
-                f"(Streak {streak_number})\n"
-                f"⏰ **Anstoßzeiten:** "
-                f"{'maximal 6 Stunden auseinander' if kickoff_cluster else 'werden ab Streak 4 nicht berücksichtigt'}\n"
-                f"✅ **Startelf-Filter:** Sorare-Prognose mindestens 60%\n"
-                f"🧠 **Strategie:** "
-                f"{'🛡️ Safe' if strategy_mode == 'safe' else ('🚀 Risky' if strategy_mode == 'risky' else '⚖️ Ausgeglichen')}\n\n"
-                f"✅ Spielberechtigte Karten: **{len(cards)}**\n"
-                f"🆕 In-Season: **{inseason_count}**\n"
-                f"🕰️ Classic: **{classic_count}**\n"
-                f"🧩 Gebaute Teams: **{len(teams)}/4**"
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates
+
+
+
+def _captain_score(
+    card: dict,
+    strategy_mode: str = "balanced",
+) -> float:
+    """
+    Captain-Auswahl nur für Feldspieler.
+
+    Safe:
+      Startelf-Sicherheit + stabiles L40 besonders wichtig.
+    Ausgeglichen:
+      L40 + Gesamt-Rating + Matchup + Standards.
+    Risky:
+      mehr Upside durch L40, offensives Matchup und Elfmeter/Ecken.
+
+    Es werden ausschließlich vorhandene Daten verwendet.
+    Fehlende Sorare-Prognosen bekommen keinen erfundenen Ersatzwert.
+    """
+    if card.get("position") == "TW":
+        return -1e9
+
+    rating = float(card.get("rating") or 0.0)
+    l40 = float(card.get("l40") or 0.0)
+    starter = card.get("starter_probability")
+    matchup = card.get("attacking_matchup_score")
+    profile = card.get("set_piece_profile") or {}
+
+    penalties = int(profile.get("penalties") or 0)
+    corners = int(profile.get("corners") or 0)
+
+    # L40 auf ungefähr 0-100 normieren, passend zum Kartenrating.
+    l40_score = max(0.0, min(100.0, (l40 / 80.0) * 100.0))
+
+    if strategy_mode == "safe":
+        components = [
+            (rating, 0.40),
+            (l40_score, 0.35),
+            (
+                float(starter)
+                if starter is not None
+                else None,
+                0.25,
             ),
+        ]
+        return _weighted_rating(components)
+
+    if strategy_mode == "risky":
+        set_piece_upside = None
+        if card.get("position") in ("MID", "ST"):
+            if penalties > 0 or corners >= 10:
+                set_piece_upside = min(
+                    100.0,
+                    penalties * 30.0
+                    + (
+                        corners * 4.0
+                        if corners >= 10
+                        else 0.0
+                    ),
+                )
+
+        components = [
+            (l40_score, 0.40),
+            (rating, 0.25),
+            (
+                float(matchup)
+                if matchup is not None
+                else None,
+                0.20,
+            ),
+            (set_piece_upside, 0.15),
+        ]
+        return _weighted_rating(components)
+
+    # Balanced / Ausgeglichen
+    set_piece_signal = None
+    if card.get("position") in ("MID", "ST"):
+        if penalties > 0 or corners >= 10:
+            set_piece_signal = min(
+                100.0,
+                penalties * 30.0
+                + (
+                    corners * 4.0
+                    if corners >= 10
+                    else 0.0
+                ),
+            )
+
+    components = [
+        (rating, 0.40),
+        (l40_score, 0.35),
+        (
+            float(matchup)
+            if matchup is not None
+            else None,
+            0.15,
+        ),
+        (set_piece_signal, 0.10),
+    ]
+    return _weighted_rating(components)
+
+
+def _select_captain(
+    lineup: List[dict],
+    strategy_mode: str = "balanced",
+) -> Optional[dict]:
+    field_players = [
+        card
+        for card in lineup
+        if card.get("position") != "TW"
+    ]
+
+    if not field_players:
+        return None
+
+    return max(
+        field_players,
+        key=lambda card: _captain_score(
+            card,
+            strategy_mode,
+        ),
+    )
+
+def build_four_streak_lineups(
+    cards: List[dict],
+    target_points: int,
+    strategy_mode: str = "balanced",
+    kickoff_cluster: bool = False,
+) -> List[dict]:
+    """
+    Baut bis zu vier komplette, voneinander unabhängige Streak-Teams.
+
+    NEUE REGEL:
+    - Nicht mehr zuerst Team 1 maximal stark machen und danach nur die Reste nutzen.
+    - Stattdessen werden die vier Teams GEMEINSAM geplant.
+    - Der Builder testet viele Kombinationen und maximiert die Gesamtqualität
+      aller vier Teams zusammen.
+    - Dieselbe Karte darf weiterhin nur in genau einem Team vorkommen.
+    - Wenn vier komplette Teams möglich sind, werden vier Teams bevorzugt.
+    - Erst wenn mit dem verfügbaren Kartenpool keine vier Teams möglich sind,
+      wird die bestmögliche kleinere Anzahl zurückgegeben.
+
+    Technisch wird eine Beam-Search verwendet. Dadurch bekommen wir eine
+    deutlich bessere globale Aufteilung, ohne bei großen Collections jede
+    theoretisch mögliche Kartenkombination vollständig durchrechnen zu müssen.
+    """
+
+    full_pool = list(cards)
+
+    # Wie viele Alternativen je Zwischenstand geprüft werden.
+    # Diese Werte sind absichtlich großzügig genug für eine gute globale Suche,
+    # aber klein genug, damit der Discord-Bot auf Railway nicht minutenlang hängt.
+    BRANCH_LIMIT = 14
+    BEAM_WIDTH = 32
+
+    def card_key(card: dict) -> str:
+        return str(card.get("card_slug") or card.get("player_slug"))
+
+    def lineup_keys(lineup: List[dict]) -> frozenset:
+        return frozenset(card_key(card) for card in lineup)
+
+    def plan_signature(plan: List[Tuple[float, List[dict]]]) -> tuple:
+        # Reihenfolge der Teams ist für die Eindeutigkeit egal.
+        return tuple(
+            sorted(
+                tuple(sorted(lineup_keys(lineup)))
+                for _, lineup in plan
+            )
         )
 
-        if zielpunkte <= 340:
-            strategy = (
-                "Sehr niedrige Streak: starke Vereins-Stacks werden bevorzugt, "
-                "bis hin zu 5 Spielern desselben Vereins."
-            )
-        elif zielpunkte <= 380:
-            strategy = (
-                "Niedrige/mittlere Streak: Vereins-Stacks werden deutlich "
-                "bevorzugt, aber Qualität bleibt wichtig."
-            )
-        elif zielpunkte <= 420:
-            strategy = (
-                "Mittlere/hohe Streak: Mischung aus Stack und Einzelqualität."
-            )
-        else:
-            strategy = (
-                "Hohe Streak: maximale Einzelqualität hat Vorrang; "
-                "Stacks geben nur noch einen kleinen Bonus."
+    # State: (Gesamtwert, Plan, verwendete Karten)
+    beam: List[Tuple[float, List[Tuple[float, List[dict]]], frozenset]] = [
+        (0.0, [], frozenset())
+    ]
+
+    best_by_depth = {0: beam[0]}
+
+    for depth in range(4):
+        expanded = []
+        seen_states = set()
+
+        for total_value, plan, used_keys in beam:
+            available_pool = [
+                card
+                for card in full_pool
+                if card_key(card) not in used_keys
+            ]
+
+            candidates = _generate_lineup_candidates(
+                available_pool,
+                target_points,
+                strategy_mode,
+                kickoff_cluster,
             )
 
-        summary.add_field(
-            name="🧠 Strategie",
-            value=strategy,
-            inline=False,
+            # Die besten unterschiedlichen Lineups dieses Zwischenstands testen.
+            for lineup_value, lineup in candidates[:BRANCH_LIMIT]:
+                keys = lineup_keys(lineup)
+
+                # Sicherheitscheck: keine Karte darf doppelt verwendet werden.
+                if keys & used_keys:
+                    continue
+
+                new_plan = plan + [(lineup_value, lineup)]
+                new_used = frozenset(set(used_keys) | set(keys))
+                new_total = total_value + float(lineup_value)
+
+                signature = (
+                    depth + 1,
+                    new_used,
+                    plan_signature(new_plan),
+                )
+                if signature in seen_states:
+                    continue
+                seen_states.add(signature)
+
+                expanded.append((new_total, new_plan, new_used))
+
+        if not expanded:
+            break
+
+        # Höchster Gesamtwert aller bisher gebauten Teams gewinnt.
+        expanded.sort(key=lambda state: state[0], reverse=True)
+        beam = expanded[:BEAM_WIDTH]
+        best_by_depth[depth + 1] = beam[0]
+
+    # Wenn vier Teams möglich sind, zwingend den besten 4er-Plan nehmen.
+    # Sonst die größtmögliche Anzahl kompletter Teams.
+    best_depth = max(best_by_depth.keys())
+    _, best_plan, _ = best_by_depth[best_depth]
+
+    # Ausgabe nach Teamstärke sortieren. Dadurch ist Team 1 innerhalb des
+    # global optimierten 4er-Pakets das stärkste Team, Team 4 das schwächste.
+    best_plan = sorted(
+        best_plan,
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    teams_raw = []
+
+    for team_number, (current_value, lineup) in enumerate(best_plan, start=1):
+        clubs_used = Counter(
+            card.get("club_name") for card in lineup
+        )
+        max_stack = max(clubs_used.values()) if clubs_used else 1
+
+        captain = _select_captain(
+            lineup,
+            strategy_mode,
         )
 
-        summary.set_footer(
-            text=(
-                "Max. 1 Classic pro Team, mindestens 4 In-Season. "
-                "Eigene Startelf-Prognosen sind deaktiviert."
-            )
-        )
-
-        await interaction.followup.send(embed=summary)
-
-        if not teams:
-            if competition_key == "contender":
-                diag = contender_inseason_diagnostics(
-                    [
-                        card
-                        for card in cards
-                        if card.get("season_year") == 2026
-                    ]
-                )
-
-                accepted_names = [
-                    row["player_name"]
-                    for row in diag["accepted"][:10]
-                ]
-
-                accepted_text = (
-                    ", ".join(accepted_names)
-                    if accepted_names
-                    else "keine"
-                )
-
-                await interaction.followup.send(
-                    "❌ Mit den verfügbaren Karten konnte kein gültiges "
-                    "5er-Team gebaut werden.\n\n"
-                    f"**Contender In-Season 2026 akzeptiert:** "
-                    f"{len(diag['accepted'])}\n"
-                    f"**Spieler:** {accepted_text}\n\n"
-                    "Im Terminal steht jetzt die vollständige Liste mit "
-                    "allen akzeptierten und abgelehnten 2026-Karten."
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Mit den verfügbaren Karten konnte kein gültiges "
-                    "5er-Team gebaut werden."
-                )
-            return
-
-        position_emoji = {
-            "TW": "🧤",
-            "VER": "🛡️",
-            "MID": "⚙️",
-            "ST": "⚡",
+        defensive_stacks = []
+        club_slugs = {
+            card.get("club_slug")
+            for card in lineup
+            if card.get("club_slug")
         }
 
-        for team in teams:
-            kickoff_line = ""
-            if kickoff_cluster:
-                spread = team.get("kickoff_spread_minutes")
-                if spread is not None:
-                    if spread == 0:
-                        kickoff_line = "⏰ Anstoß: **alle gleichzeitig**\n"
-                    elif spread < 60:
-                        kickoff_line = (
-                            f"⏰ Anstoßfenster: **{spread} Min.**\n"
-                        )
-                    else:
-                        hours = spread // 60
-                        minutes = spread % 60
-                        kickoff_line = (
-                            f"⏰ Anstoßfenster: **{hours} Std. "
-                            f"{minutes} Min.**\n"
-                        )
+        for club_slug in club_slugs:
+            club_cards = [
+                card
+                for card in lineup
+                if card.get("club_slug") == club_slug
+            ]
+            positions = {card.get("position") for card in club_cards}
 
-            embed = discord.Embed(
-                title=(
-                    f"🔥 TEAM {team['number']} – "
-                    f"≈ {team.get('projected_total', 0):.1f} Punkte"
-                ),
-                description=(
-                    f"📈 Basis-Prognose: **{team.get('projected_base_total', 0):.1f}**\n"
-                    f"✨ Mit Kartenboni: **{team.get('projected_total', 0):.1f}**\n"
-                    f"⭐ Team-Rating: **{team['team_rating']}/100**\n"
-                    + kickoff_line
-                    + f"🏟️ Stack: **{team['stack_size']}× "
-                    f"{team['stack_club']}**\n"
-                    + (
-                        "🧤🛡️ Defensiv-Stack: **"
-                        + ", ".join(team.get("defensive_stacks") or [])
-                        + "**\n"
-                        if team.get("defensive_stacks")
-                        else ""
-                    )
-                    + f"👑 Captain-Vorschlag: "
-                    f"**{team['captain'].get('player_name')}**"
-                    + (
-                        f" · Captain-Score "
-                        f"**{team.get('captain_score')}/100**"
-                        if team.get("captain_score") is not None
-                        else ""
-                    )
-                ),
-            )
-
-            for index, card in enumerate(team["cards"], start=1):
-                position = card.get("position")
-                emoji = position_emoji.get(position, "👤")
-                game = card.get("next_game") or {}
-
-                if game.get("home_away") == "H":
-                    fixture_text = (
-                        f"🏠 vs. {game.get('opponent_name') or '?'}"
-                    )
-                else:
-                    fixture_text = (
-                        f"✈️ bei {game.get('opponent_name') or '?'}"
-                    )
-
-                season_text = (
-                    "🆕 In-Season"
-                    if card.get("in_season")
-                    else f"🕰️ Classic {card.get('season_year')}"
-                )
-
-                starter = card.get("starter_probability")
-                if starter is None:
-                    starter_text = "✅ Startelf: keine Sorare-Prognose"
-                else:
-                    starter_text = (
-                        f"✅ Startelf: {starter:.0f}% · Sorare"
-                    )
-
-                cs_text = ""
-                if position in ("TW", "VER"):
-                    cs = card.get("clean_sheet_probability")
-                    if cs is not None:
-                        cs_text = f"\n🧤 Clean Sheet: {cs}%"
-
-                matchup_text = ""
-                if position in ("MID", "ST"):
-                    matchup = card.get("attacking_matchup_score")
-                    if matchup is not None:
-                        matchup_text = (
-                            f"\n⚔️ Offensiv-Matchup: {matchup}/100"
-                        )
-
-                set_piece_text = ""
-                if position in ("MID", "ST"):
-                    profile = card.get("set_piece_profile")
-                    if profile:
-                        parts = []
-
-                        if profile.get("penalties", 0) > 0:
-                            parts.append(
-                                f"⚽ Elfmeter: {profile['penalties']}"
-                            )
-
-                        if profile.get("corners", 0) >= 10:
-                            parts.append(
-                                f"🚩 Ecken: {profile['corners']}"
-                            )
-
-                        # Nur anzeigen, wenn der Spieler diese Standards
-                        # wirklich ausgeführt hat.
-                        if parts:
-                            set_piece_text = (
-                                "\n🎯 "
-                                + " · ".join(parts)
-                            )
-
-                bonus_parts = []
-
-                if card.get("inseason_bonus_pct", 0) > 0:
-                    bonus_parts.append(
-                        f"In-Season +{card['inseason_bonus_pct']:.1f}%"
-                    )
-
-                if card.get("xp_bonus_pct", 0) > 0:
-                    bonus_parts.append(
-                        f"XP +{card['xp_bonus_pct']:.1f}%"
-                    )
-
-                if card.get("collection_bonus_pct", 0) > 0:
-                    bonus_parts.append(
-                        f"Sammlung +{card['collection_bonus_pct']:.1f}%"
-                    )
-
-                bonus_text = (
-                    " · ".join(bonus_parts)
-                    if bonus_parts
-                    else "keine Kartenboni"
-                )
-
-                embed.add_field(
-                    name=(
-                        f"{index}. {emoji} "
-                        f"{card.get('player_name')} · {position}"
+            if "TW" in positions and "VER" in positions:
+                club_name = next(
+                    (
+                        card.get("club_name")
+                        for card in club_cards
+                        if card.get("club_name")
                     ),
-                    value=(
-                        f"🔮 Punkte-Prognose: "
-                        f"**{card.get('projected_base_points', 0):.1f}** "
-                        f"→ **{card.get('projected_card_points', 0):.1f}** "
-                        f"inkl. Bonus\n"
-                        f"✨ Bonus: **{bonus_text}** "
-                        f"(gesamt +{card.get('total_card_bonus_pct', 0):.1f}%)\n"
-                        f"⭐ Rating: **{card.get('rating', 0):.1f}/100**\n"
-                        f"📊 L40: **{card.get('l40', 0):.2f}**\n"
-                        f"{fixture_text}\n"
-                        f"{starter_text}{cs_text}{matchup_text}{set_piece_text}\n"
-                        f"{season_text}"
-                    ),
-                    inline=False,
+                    club_slug,
                 )
+                defensive_stacks.append(club_name)
 
-            classic_used = sum(
-                1
-                for card in team["cards"]
-                if card.get("classic")
-            )
+        kickoff_times = [
+            _card_kickoff_datetime(card)
+            for card in lineup
+        ]
+        kickoff_times = [
+            dt for dt in kickoff_times
+            if dt is not None
+        ]
 
-            embed.set_footer(
-                text=(
-                    f"Classic-Slots: {classic_used}/1 · "
-                    f"In-Season: {5 - classic_used}/5"
-                )
-            )
+        kickoff_spread = _kickoff_spread_minutes(lineup)
 
-            await interaction.followup.send(embed=embed)
-
-    except Exception as exc:
-        print(f"FEHLER /streakteam: {exc}")
-        await interaction.followup.send(
-            f"❌ Fehler:\n```{str(exc)[:1700]}```"
+        projected_base_total = round(
+            sum(
+                float(card.get("projected_base_points") or 0.0)
+                for card in lineup
+            ),
+            1,
         )
 
+        projected_bonus_total = round(
+            sum(
+                float(card.get("projected_card_points") or 0.0)
+                for card in lineup
+            ),
+            1,
+        )
 
-@bot.event
-async def setup_hook():
-    try:
-        synced = await bot.tree.sync(guild=guild_object)
-        print(f"{len(synced)} Slash-Befehl(e) synchronisiert.")
-    except Exception as exc:
-        print(f"Fehler beim Synchronisieren: {exc}")
+        teams_raw.append({
+            "number": team_number,
+            "cards": lineup,
+            "projected_base_total": projected_base_total,
+            "projected_total": projected_bonus_total,
+            "kickoff_spread_minutes": kickoff_spread,
+            "kickoff_first": (
+                min(kickoff_times).isoformat()
+                if kickoff_times
+                else None
+            ),
+            "kickoff_last": (
+                max(kickoff_times).isoformat()
+                if kickoff_times
+                else None
+            ),
+            "captain": captain,
+            "captain_score": (
+                round(_captain_score(captain, strategy_mode), 1)
+                if captain
+                else None
+            ),
+            "stack_size": max_stack,
+            "stack_club": (
+                clubs_used.most_common(1)[0][0]
+                if clubs_used
+                else "-"
+            ),
+            "defensive_stacks": defensive_stacks,
+            "team_rating": round(
+                sum(card.get("rating", 0) for card in lineup) / 5,
+                1,
+            ),
+            "lineup_value": round(current_value, 1),
+        })
 
-
-bot.run(DISCORD_TOKEN)
+    return teams_raw
